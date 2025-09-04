@@ -1,1 +1,27 @@
 plots/
+__pycache__/
+.ipynb_checkpoints/
+
+# --- Python 추가 무시 규칙 ---
+*.pyc
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+*.whl
+.vscode/
+.idea/
+*.swp
+*.swo
+*.log
+*.out
+*.dat
+*.tmp
