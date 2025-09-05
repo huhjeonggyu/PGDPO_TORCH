@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import random
 import importlib
+import random
 from typing import Callable, Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -19,28 +19,32 @@ try:
         # 장치/격자/차원
         device,  # torch.device
         T, m, d, k,
-        DIM_X, DIM_Y, DIM_U,            # ✅ 추가: 사용자 정의 차원 그대로 재노출
+        DIM_X, DIM_Y, DIM_U,
         # 하이퍼파라미터/시드
-        epochs, batch_size, lr, seed,
+        epochs, batch_size, lr,
         # 평가용 공통 시드
         CRN_SEED_EU,
         # 데이터/시뮬레이터/정책
-        sample_initial_states,  # (B, rng=Generator) -> (states_dict, aux?)
-        simulate,               # simulate(policy, B, initial_states_dict=..., random_draws=(ZX, ZY), m_steps=m) -> U
-        DirectPolicy,           # nn.Module
+        sample_initial_states,    # (B, rng=Generator) -> (states_dict, aux?)
+        simulate,                 # simulate(policy, B, initial_states_dict=..., random_draws=(ZX, ZY), m_steps=m) -> U
+        DirectPolicy,             # nn.Module
         # 평가 배치 크기
         N_eval_states,
     )
+    from user_pgdpo_base import seed as default_seed
+    seed = default_seed  # run.py 호환을 위해 전역 이름으로 재노출
 except Exception as e:
     raise RuntimeError(f"[pgdpo_base] Failed to import symbols from user_pgdpo_base: {e}")
+
+# -----------------------------------------------------------------------------
+# Trajectory report settings
+# -----------------------------------------------------------------------------
+PGDPO_TRAJ_B: int = 5  # 경로 개수(B)
 
 # -----------------------------------------------------------------------------
 # RNG 유틸
 # -----------------------------------------------------------------------------
 def make_generator(seed_local: Optional[int] = None) -> torch.Generator:
-    """
-    Torch RNG 생성기. 가능하면 사용자 device에 올리고, 실패 시 CPU 생성.
-    """
     if seed_local is None:
         seed_local = 0
     try:
@@ -49,7 +53,6 @@ def make_generator(seed_local: Optional[int] = None) -> torch.Generator:
         gen = torch.Generator()
     gen.manual_seed(int(seed_local))
     return gen
-
 
 def set_global_seeds(seed_value: int) -> None:
     random.seed(seed_value)
@@ -62,11 +65,6 @@ def set_global_seeds(seed_value: int) -> None:
 # 공통 노이즈 생성 (X: d, Y: k)
 # -----------------------------------------------------------------------------
 def _draw_base_normals(B: int, steps: int, gen: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    시뮬레이션용 표준정규 노이즈를 (ZX, ZY)로 분리 생성.
-    Shapes:
-      ZX: (B, steps, d), ZY: (B, steps, k)
-    """
     Z = torch.randn(B, steps, d + k, device=device, generator=gen)
     ZX, ZY = Z[:, :, :d], Z[:, :, d:]
     return ZX, ZY
@@ -86,45 +84,35 @@ def run_common(
     공통 실행기(간소화 버전):
       1) 전역 시드 고정
       2) 학습 함수 호출 (train_kwargs 전달)
-      3) 폐형해는 오직 user_pgdpo_base.build_closed_form_policy()만 사용
-         - 반환이 (module, extra) 형태면 module만 사용
-         - 반환이 module이면 그대로 사용
-         - 반환이 callable이면 간단 래퍼(nn.Module)로 감싸 사용
+      3) 폐형해는 user_pgdpo_base.build_closed_form_policy()만 사용
       4) RMSE/플롯 함수 호출 (rmse_kwargs 전달)
+      5) (옵션) CRN 경로 리포트 저장
     """
-    set_global_seeds(int(seed_train if seed_train is not None else seed))
+    set_global_seeds(int(seed_train) if seed_train is not None else int(default_seed))
     train_kwargs = train_kwargs or {}
     rmse_kwargs = rmse_kwargs or {}
 
     # 1) 학습
     policy = train_fn(**train_kwargs)
 
-    # 2) 폐형해: build_closed_form_policy만 사용
+    # 2) 폐형해 로드
     cf_policy = None
     try:
         upb = importlib.import_module("user_pgdpo_base")
         if hasattr(upb, "build_closed_form_policy") and callable(upb.build_closed_form_policy):
             res = upb.build_closed_form_policy()
-
-            # (module, extra) 형태 지원
-            if isinstance(res, tuple) and len(res) >= 1:
-                res0 = res[0]
-            else:
-                res0 = res
-
+            res0 = res[0] if isinstance(res, tuple) else res
             if isinstance(res0, nn.Module):
                 cf_policy = res0.to(device)
                 print("✅ Closed-form policy loaded via build_closed_form_policy()")
             elif callable(res0):
                 class _Wrap(nn.Module):
-                    def __init__(self, f):
-                        super().__init__(); self.f = f
-                    def forward(self, **states):
-                        return self.f(**states)
+                    def __init__(self, f): super().__init__(); self.f = f
+                    def forward(self, **states): return self.f(**states)
                 cf_policy = _Wrap(res0).to(device)
                 print("✅ Closed-form callable wrapped as nn.Module via build_closed_form_policy()")
             else:
-                print("ℹ️ build_closed_form_policy() returned unsupported type; ignoring closed-form.")
+                print("ℹ️ Unsupported closed-form type; ignoring.")
         else:
             print("ℹ️ build_closed_form_policy() not found; proceeding without closed-form.")
     except Exception as e:
@@ -133,6 +121,17 @@ def run_common(
 
     # 3) 평가/시각화
     rmse_fn(policy, cf_policy, **rmse_kwargs)
+
+    # 4) (옵션) CRN trajectory report — 평가 outdir과 동일 폴더에 저장
+    try:
+        from core.traj import generate_and_save_trajectories  # 함수 안에서 import → 순환 방지
+        saved = generate_and_save_trajectories(
+            policy, cf_policy, B=PGDPO_TRAJ_B, seed=int(CRN_SEED_EU),
+            outdir=rmse_kwargs.get("outdir", None),
+        )
+        print(f"[traj] saved CRN trajectories to: {saved}")
+    except Exception as e:
+        print(f"[traj] skipped due to error: {e}")
 
 # -----------------------------------------------------------------------------
 # 기본 학습 루프(Base)
@@ -193,25 +192,19 @@ def train_stage1_base(
     return policy
 
 # -----------------------------------------------------------------------------
-# base 모드 평가기: learn↔cf만 비교/플롯
+# base 모드 평가기: learn↔cf 비교/플롯
 # -----------------------------------------------------------------------------
 @torch.no_grad()
 def print_policy_rmse_and_samples_base(
     pol_s1: nn.Module,
     pol_cf: Optional[nn.Module],
     *,
-    repeats: int = 0,            # run.py 호환을 위해 받지만 사용하지 않음
-    sub_batch: int = 0,          # run.py 호환을 위해 받지만 사용하지 않음
+    repeats: int = 0,            # run.py 호환용(미사용)
+    sub_batch: int = 0,          # run.py 호환용(미사용)
     seed_eval: Optional[int] = None,
-    tile: Optional[int] = None,  # 호환 인자 (미사용)
+    tile: Optional[int] = None,  # 호환 인자(미사용)
     outdir: Optional[str] = None,
 ) -> None:
-    """
-    Base 모드 평가기.
-    - u_learn = pol_s1(**states)
-    - (있으면) u_cf = pol_cf(**states)
-    - RMSE 출력 + 겹쳐 히스토그램/산점도 저장 (u_pp는 없음)
-    """
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
 
@@ -227,19 +220,14 @@ def print_policy_rmse_and_samples_base(
 
     if outdir is not None:
         try:
-            from viz import (
-                save_policy_scatter,
-                save_overlaid_delta_hists,
-                append_metrics_csv,
-            )
-            # 산점도/차이 분포 저장 (대표 좌표 0)
+            from viz import save_policy_scatter, save_overlaid_delta_hists, append_metrics_csv
             save_policy_scatter(
                 u_ref=u_cf, u_pred=u_learn, outdir=outdir, coord=0,
-                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf", ylabel="u_learn"
+                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf", ylabel="u_learn",
             )
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=None, u_cf=u_cf,
-                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60, density=True
+                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60, density=True,
             )
             append_metrics_csv({"rmse_learn_cf_base": rmse}, outdir)
         except Exception as e:
@@ -257,10 +245,7 @@ def print_policy_rmse_and_samples_base(
                 parts.append(f"{k_}={ts.item():.3f}")
         if vec: parts.append("...")
         sstr = ", ".join(parts)
-        print(
-            f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, "
-            f"u_cf[0]={u_cf[i,0].item():.4f}, ...)"
-        )
+        print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_cf[0]={u_cf[i,0].item():.4f}, ...)")
 
 # -----------------------------------------------------------------------------
 # (선택) 간단 비교기 유지
@@ -273,15 +258,10 @@ def compare_policy_functions(
     seed_eval: Optional[int] = None,
     outdir: Optional[str] = None,
 ) -> None:
-    """
-    학습 정책 vs 폐형해 비교. 폐형해가 없으면 스킵.
-    (간단 버전; base 모드 평가기가 있으므로 보조 용도)
-    """
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
 
     u_learn = policy(**states_dict)
-
     if cf_policy is None:
         print("[INFO] No closed-form policy available; skipping base comparison.")
         return
@@ -292,44 +272,18 @@ def compare_policy_functions(
 
     if outdir is not None:
         try:
-            from viz import (
-                save_policy_scatter,
-                save_overlaid_delta_hists,  # 겹침 히스토그램 사용
-                append_metrics_csv,
-            )
+            from viz import save_policy_scatter, save_overlaid_delta_hists, append_metrics_csv
             save_policy_scatter(
                 u_ref=u_cf, u_pred=u_learn, outdir=outdir, coord=0,
-                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf", ylabel="u_learn"
+                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf", ylabel="u_learn",
             )
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=None, u_cf=u_cf,
-                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60, density=True
+                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60, density=True,
             )
             append_metrics_csv({"rmse_learn_cf_base": rmse}, outdir)
         except Exception as e:
             print(f"[WARN] base: could not save compare plots: {e}")
-
-# -----------------------------------------------------------------------------
-# 독립 실행 테스트
-# -----------------------------------------------------------------------------
-def main():
-    """
-    Quick standalone test for base mode:
-    - Train Stage-1 (base)
-    - Evaluate with base evaluator (learn vs cf only)
-    """
-    run_common(
-        train_fn=train_stage1_base,
-        rmse_fn=print_policy_rmse_and_samples_base,
-        train_kwargs={},  # 필요 시 epochs/lr/outdir override 가능
-        rmse_kwargs={
-            "seed_eval": CRN_SEED_EU,
-            # "outdir": "<원하면 경로 지정>"
-        },
-    )
-
-if __name__ == "__main__":
-    main()
 
 # -----------------------------------------------------------------------------
 # __all__
@@ -338,9 +292,9 @@ __all__ = [
     # 환경/격자/차원/하이퍼
     "device", "T", "m", "d", "k", "epochs", "batch_size", "lr", "seed",
     "CRN_SEED_EU", "N_eval_states",
-    "DIM_X", "DIM_Y", "DIM_U",              # ✅ 추가 재노출
+    "DIM_X", "DIM_Y", "DIM_U",
     # 유틸
-    "make_generator", "set_global_seeds",
+    "make_generator", "set_global_seeds", "_draw_base_normals",
     # 사용자 훅/심볼 재노출
     "sample_initial_states", "simulate", "DirectPolicy",
     # 공통 실행기/루프/비교
