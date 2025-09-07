@@ -16,41 +16,29 @@ import torch.nn as nn
 # -----------------------------------------------------------------------------
 try:
     from user_pgdpo_base import (
-        # 장치/격자/차원
-        device,  # torch.device
-        T, m, d, k,
+        device, T, m, d, k,
         DIM_X, DIM_Y, DIM_U,
-        # 하이퍼파라미터/시드
         epochs, batch_size, lr,
-        # 평가용 공통 시드
         CRN_SEED_EU,
-        # 데이터/시뮬레이터/정책
-        sample_initial_states,    # (B, rng=Generator) -> (states_dict, aux?)
-        simulate,                 # simulate(policy, B, initial_states_dict=..., random_draws=(ZX, ZY), m_steps=m) -> U
-        DirectPolicy,             # nn.Module
-        # 평가 배치 크기
+        sample_initial_states,
+        simulate,
+        DirectPolicy,
         N_eval_states,
     )
     from user_pgdpo_base import seed as default_seed
-    seed = default_seed  # run.py 호환을 위해 전역 이름으로 재노출
+    seed = default_seed
 except Exception as e:
     raise RuntimeError(f"[pgdpo_base] Failed to import symbols from user_pgdpo_base: {e}")
 
-# -----------------------------------------------------------------------------
-# Trajectory report settings
-# -----------------------------------------------------------------------------
-PGDPO_TRAJ_B: int = 5  # 경로 개수(B)
+PGDPO_TRAJ_B: int = 5
 
 # -----------------------------------------------------------------------------
 # RNG 유틸
 # -----------------------------------------------------------------------------
 def make_generator(seed_local: Optional[int] = None) -> torch.Generator:
-    if seed_local is None:
-        seed_local = 0
-    try:
-        gen = torch.Generator(device=device)
-    except Exception:
-        gen = torch.Generator()
+    if seed_local is None: seed_local = 0
+    try: gen = torch.Generator(device=device)
+    except Exception: gen = torch.Generator()
     gen.manual_seed(int(seed_local))
     return gen
 
@@ -61,9 +49,6 @@ def set_global_seeds(seed_value: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_value)
 
-# -----------------------------------------------------------------------------
-# 공통 노이즈 생성 (X: d, Y: k)
-# -----------------------------------------------------------------------------
 def _draw_base_normals(B: int, steps: int, gen: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
     Z = torch.randn(B, steps, d + k, device=device, generator=gen)
     ZX, ZY = Z[:, :, :d], Z[:, :, d:]
@@ -80,58 +65,38 @@ def run_common(
     train_kwargs: Optional[Dict[str, Any]] = None,
     rmse_kwargs: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    공통 실행기(간소화 버전):
-      1) 전역 시드 고정
-      2) 학습 함수 호출 (train_kwargs 전달)
-      3) 폐형해는 user_pgdpo_base.build_closed_form_policy()만 사용
-      4) RMSE/플롯 함수 호출 (rmse_kwargs 전달)
-      5) (옵션) CRN 경로 리포트 저장
-    """
     set_global_seeds(int(seed_train) if seed_train is not None else int(default_seed))
     train_kwargs = train_kwargs or {}
     rmse_kwargs = rmse_kwargs or {}
 
-    # 1) 학습
     policy = train_fn(**train_kwargs)
 
-    # 2) 폐형해 로드
     cf_policy = None
     try:
         upb = importlib.import_module("user_pgdpo_base")
         if hasattr(upb, "build_closed_form_policy") and callable(upb.build_closed_form_policy):
             res = upb.build_closed_form_policy()
-            res0 = res[0] if isinstance(res, tuple) else res
-            if isinstance(res0, nn.Module):
-                cf_policy = res0.to(device)
-                print("✅ Closed-form policy loaded via build_closed_form_policy()")
-            elif callable(res0):
-                class _Wrap(nn.Module):
-                    def __init__(self, f): super().__init__(); self.f = f
-                    def forward(self, **states): return self.f(**states)
-                cf_policy = _Wrap(res0).to(device)
-                print("✅ Closed-form callable wrapped as nn.Module via build_closed_form_policy()")
-            else:
-                print("ℹ️ Unsupported closed-form type; ignoring.")
-        else:
-            print("ℹ️ build_closed_form_policy() not found; proceeding without closed-form.")
+            cf_policy = (res[0] if isinstance(res, tuple) else res).to(device)
+            print("✅ Closed-form policy loaded via build_closed_form_policy()")
     except Exception as e:
         print(f"[WARN] build_closed_form_policy() failed: {e}")
-        cf_policy = None
 
-    # 3) 평가/시각화
     rmse_fn(policy, cf_policy, **rmse_kwargs)
 
-    # 4) (옵션) CRN trajectory report — 평가 outdir과 동일 폴더에 저장
     try:
-        from core.traj import generate_and_save_trajectories  # 함수 안에서 import → 순환 방지
+        from core.traj import generate_and_save_trajectories
         saved = generate_and_save_trajectories(
-            policy, cf_policy, B=PGDPO_TRAJ_B, seed=int(CRN_SEED_EU),
+            policy_learn=policy, 
+            policy_cf=cf_policy, 
+            B=PGDPO_TRAJ_B,
+            seed_crn=int(CRN_SEED_EU),  # 'seed=' -> 'seed_crn='으로 수정
             outdir=rmse_kwargs.get("outdir", None),
         )
         print(f"[traj] saved CRN trajectories to: {saved}")
     except Exception as e:
+        import traceback
         print(f"[traj] skipped due to error: {e}")
+        traceback.print_exc()
 
 # -----------------------------------------------------------------------------
 # 기본 학습 루프(Base)

@@ -128,25 +128,18 @@ def save_delta_hist(
     coord: int = 0,
     bins: int = 50,
 ) -> str:
-    """
-    (u_a - u_b) 히스토그램 저장.
-    """
     _ensure_dir(outdir)
-
     a = _as_numpy_1d(u_a, coord=coord)
     b = _as_numpy_1d(u_b, coord=coord)
     delta = a - b
-
     fig = plt.figure(figsize=(6.0, 4.0))
     ax = fig.add_subplot(111)
     ax.hist(delta, bins=bins)
     ax.set_xlabel(label or "delta")
     ax.set_ylabel("count")
-
     mu = float(np.mean(delta))
     sd = float(np.std(delta))
     ax.set_title(f"mean={mu:.4f}, std={sd:.4f}")
-
     out_path = os.path.join(outdir, fname)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -280,13 +273,12 @@ def append_metrics_csv(metrics: Dict[str, Any], outdir: str, fname: str = "metri
     _ensure_dir(outdir)
     path = os.path.join(outdir, fname)
     file_exists = os.path.exists(path)
-    with open(path, "r" if file_exists else "w", newline="", encoding="utf-8") as f:
-        if file_exists:
+    header, rows = [], []
+    if file_exists:
+        with open(path, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             header = reader.fieldnames or []
             rows = list(reader)
-        else:
-            header, rows = [], []
     
     new_keys = [k for k in metrics if k not in header]
     header.extend(new_keys)
