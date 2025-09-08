@@ -57,11 +57,13 @@ R_matrix = torch.eye(d, device=device) * alpha_val
 
 # Myopic analytical control tracks this net load
 def N_agg(t_tensor: torch.Tensor) -> torch.Tensor:
-    # shape: (B,1) -> (B,1)
-    return 2.5 * torch.sin(2 * torch.pi * t_tensor / T)
+    # 배터리 1대당 평균 0.25의 출력을 낸다고 가정
+    capacity_per_battery = 0.25
+    max_power = d * capacity_per_battery
+    return max_power * torch.sin(2 * torch.pi * t_tensor / T)
 
 # Control bounds (optional; used by our policy if soft-clip on)
-u_min, u_max = -1.0, 1.0
+u_min, u_max = -10.0, 10.0
 use_soft_clip  = False
 soft_k = 3.0
 
