@@ -1,29 +1,50 @@
 # tests/harvest/user_pgdpo_base.py
 # Harvesting (§5.4) — PG-DPO baseline (rng 호환 simulate, myopic을 참조정책으로 노출)
-
+import os
 import math
 import torch
 import torch.nn as nn
 
+# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
+
+# 1. 모델 고유의 기본값을 설정합니다.
+d = 5
+k = 0  # ✨ Harvest 모델은 k=0 으로 고정되어야 합니다.
+epochs = 200
+batch_size = 256
+lr = 3e-4
+seed = 2025
+
+# 2. 변경 가능한 파라미터만 환경변수로부터 덮어씁니다.
+d = int(os.getenv("PGDPO_D", d))
+epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
+batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
+lr = float(os.getenv("PGDPO_LR", lr))
+seed = int(os.getenv("PGDPO_SEED", seed))
+# k는 이 모델의 정의에 따라 0으로 유지됩니다.
+
+# --- 블록 끝 ---
+
+
 # --------------------------- Device / seed ---------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-seed = 2025
+# seed = 2025 <-- 상단 블록에서 제어
 torch.manual_seed(seed)
 
 # --------------------------- Horizon / steps -------------------------
 T = 2.0
 m = 50  # steps
-epochs = 200
-lr = 3e-4
-batch_size = 256
+# epochs = 200 <-- 상단 블록에서 제어
+# lr = 3e-4 <-- 상단 블록에서 제어
+# batch_size = 256 <-- 상단 블록에서 제어
 CRN_SEED_EU = 24680  # common random numbers for eval
 
 # >>> 코어 RMSE 헬퍼가 기대하는 평가 샘플 수
 N_eval_states = 1000
 
 # --------------------------- Dimensions ------------------------------
-N_species = 5
-d = N_species         # state dim: X (biomass per species)
+N_species = d         # d는 이제 외부에서 제어됩니다.
+# d = N_species       # state dim: X (biomass per species) <-- 중복
 du = N_species        # control dim: harvesting rate per species
 
 # --------------------------- Problem params --------------------------

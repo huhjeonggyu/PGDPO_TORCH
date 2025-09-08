@@ -1,18 +1,38 @@
 # user_pgdpo_base.py for 1-dimensional Kim-Omberg Problem
 # 역할: 1차원 Kim-Omberg 모델의 모든 사용자 정의 요소를 설정합니다.
 #       (고정된 표준 파라미터 사용)
-
+import os
 import torch
 import torch.nn as nn
 from closed_form_ref import precompute_ABC, ClosedFormPolicy
+
+# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
+
+# 1. 모델 고유의 기본값을 설정합니다.
+# ✨ ko_1d 모델은 d=1, k=1 로 차원이 고정되므로, 환경변수에서 읽지 않습니다.
+d = 1
+k = 1 
+epochs = 200
+batch_size = 1024
+lr = 1e-4
+seed = 42
+
+# 2. 변경 가능한 하이퍼파라미터만 환경변수로부터 덮어씁니다.
+epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
+batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
+lr = float(os.getenv("PGDPO_LR", lr))
+seed = int(os.getenv("PGDPO_SEED", seed))
+
+# --- 블록 끝 ---
+
 
 # ==============================================================================
 # ===== (A) 사용자 정의 영역: 모델 차원, 파라미터, 하이퍼파라미터 =====
 # ==============================================================================
 
 # --------------------------- Model Dimensions ---------------------------
-d = 1  # ✨ 1개의 위험 자산
-k = 1  # ✨ 1개의 확률 팩터
+# d = 1  # ✨ 1개의 위험 자산 <-- 상단 블록에서 고정
+# k = 1  # ✨ 1개의 확률 팩터 <-- 상단 블록에서 고정
 
 DIM_X = 1
 DIM_Y = k
@@ -20,7 +40,7 @@ DIM_U = d
 
 # --------------------------- Config ---------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-seed = 42
+# seed = 42 <-- 상단 블록에서 제어
 
 # --------------------------- Market & Utility Parameters ---------------------------
 r = 0.03
@@ -61,9 +81,9 @@ Y0_range = (Y_min_vec, Y_max_vec)
 X0_range = (0.5, 1.5)
 u_cap = 10.0
 lb_X  = 1e-5
-epochs = 200
-batch_size = 1024
-lr = 1e-4
+# epochs = 200 <-- 상단 블록에서 제어
+# batch_size = 1024 <-- 상단 블록에서 제어
+# lr = 1e-4 <-- 상단 블록에서 제어
 N_eval_states = 2000
 CRN_SEED_EU = 12345
 

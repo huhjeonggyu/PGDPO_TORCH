@@ -1,23 +1,44 @@
 # tests/vpp/user_pgdpo_base.py
 # VPP benchmark (based on the stable single-file script), split into base/policy/sim
 # Exposes all symbols expected by core/pgdpo_base.py
-
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 
+# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
+
+# 1. 모델 고유의 기본값을 설정합니다.
+d = 10
+k = 0  # ✨ VPP 모델은 k=0 으로 고정되어야 합니다.
+epochs = 500
+batch_size = 1024
+lr = 1e-4
+seed = 42
+
+# 2. 변경 가능한 파라미터만 환경변수로부터 덮어씁니다.
+d = int(os.getenv("PGDPO_D", d))
+epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
+batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
+lr = float(os.getenv("PGDPO_LR", lr))
+seed = int(os.getenv("PGDPO_SEED", seed))
+# k는 이 모델의 정의에 따라 0으로 유지됩니다.
+
+# --- 블록 끝 ---
+
+
 # ================== (A) Dimensions & global config ==================
-d = 10                              # number of batteries (state dim)
-k = 0                                   # no exogenous Y
+# d = 10                              # number of batteries (state dim) <-- 상단 블록에서 제어
+# k = 0                               # no exogenous Y <-- 상단 블록에서 고정
 DIM_X, DIM_Y, DIM_U = d, k, d
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- Required training hyperparams (exported for core) ----
-epochs      = 500
-batch_size  = 1024
-lr          = 1e-4
-seed        = 42          # used by core for seeding
+# epochs      = 500 <-- 상단 블록에서 제어
+# batch_size  = 1024 <-- 상단 블록에서 제어
+# lr          = 1e-4 <-- 상단 블록에서 제어
+# seed        = 42          # used by core for seeding <-- 상단 블록에서 제어
 CRN_SEED_EU = 777         # common random number seed for eval (exported)
 N_eval_states = 2048      # eval batch size (exported)
 

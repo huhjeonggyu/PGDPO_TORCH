@@ -1,9 +1,30 @@
 # user_pgdpo_base.py for N-dimensional Merton Problem
 # 역할: 다차원 머튼 모델의 모든 사용자 정의 요소를 설정합니다.
 #       (1) 모델 차원 및 파라미터, (2) 정책 신경망, (3) 시뮬레이션 동역학
-
+import os
 import torch
 import torch.nn as nn
+
+# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
+
+# 1. 모델 고유의 기본값을 설정합니다.
+d = 5
+k = 0  # ✨ 머튼 문제는 k=0 으로 고정되어야 합니다.
+epochs = 200
+batch_size = 1024
+lr = 1e-4
+seed = 42
+
+# 2. 변경 가능한 파라미터만 환경변수로부터 덮어씁니다.
+d = int(os.getenv("PGDPO_D", d))
+epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
+batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
+lr = float(os.getenv("PGDPO_LR", lr))
+seed = int(os.getenv("PGDPO_SEED", seed))
+# k는 이 모델의 정의에 따라 0으로 유지되므로 환경변수에서 읽지 않습니다.
+
+# --- 블록 끝 ---
+
 
 # ==============================================================================
 # ===== (A) 사용자 정의 영역: 모델 차원, 파라미터, 하이퍼파라미터 =====
@@ -11,8 +32,8 @@ import torch.nn as nn
 
 # --------------------------- Model Dimensions ---------------------------
 # d: 자산 수, k: 팩터 수
-d = 5  # 5차원 머튼 문제로 설정
-k = 0  # ✨ 머튼 문제의 핵심: 팩터 없음 (k=0)
+# d = 5  # 5차원 머튼 문제로 설정 <-- 상단 블록에서 제어
+# k = 0  # ✨ 머튼 문제의 핵심: 팩터 없음 (k=0) <-- 상단 블록에서 고정
 
 DIM_X = 1      # 자산 X는 부(wealth)를 의미하므로 1차원
 DIM_Y = k      # 외생 변수 Y 없음 (0차원)
@@ -20,7 +41,7 @@ DIM_U = d      # 제어 u는 d개 자산에 대한 투자 비율
 
 # --------------------------- Config ---------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-seed = 42
+# seed = 42 <-- 상단 블록에서 제어
 
 # --------------------------- Market & Utility Parameters ---------------------------
 r = 0.03
@@ -36,9 +57,9 @@ u_cap = 10.
 lb_X  = 1e-5
 
 # --------------------------- Training Hyperparameters ---------------------------
-epochs     = 200
-batch_size = 1024
-lr         = 1e-4
+# epochs     = 200 <-- 상단 블록에서 제어
+# batch_size = 1024 <-- 상단 블록에서 제어
+# lr         = 1e-4 <-- 상단 블록에서 제어
 
 # --------------------------- Evaluation Parameters ---------------------------
 N_eval_states = 2000
@@ -52,11 +73,11 @@ def _generate_merton_params(d, r, dev, seed=None):
 
     # 상수 형태의 기대수익률 벡터 (mu)와 공분산 행렬 (Sigma) 생성
     # alpha는 리스크 프리미엄(mu - r)을 의미
-    alpha = torch.empty(d).uniform_(0.05, 0.15) 
+    alpha = torch.empty(d, device=dev).uniform_(0.05, 0.15) 
 
     # Positive-definite 공분산 행렬 Sigma 생성
-    L = torch.randn(d, d) * 0.5
-    Sigma = L @ L.T + torch.diag(torch.empty(d).uniform_(0.02, 0.05)) # 대각 성분에 값을 더해 안정성 확보
+    L = torch.randn(d, d, device=dev) * 0.5
+    Sigma = L @ L.T + torch.diag(torch.empty(d, device=dev).uniform_(0.02, 0.05)) # 대각 성분에 값을 더해 안정성 확보
     Sigma_inv = torch.linalg.inv(Sigma)
 
     params = {'alpha': alpha, 'Sigma': Sigma, 'Sigma_inv': Sigma_inv}
@@ -80,12 +101,6 @@ Y0_range = None
 # ==============================================================================
 # ===== (B) 사용자 정의 영역: 정책 네트워크 및 모델 동역학 =====
 # ==============================================================================
-# 
-# 참고: 아래의 DirectPolicy, sample_initial_states, simulate, build_closed_form_policy는
-#       Kim-Omberg 예제의 것과 동일합니다. 프레임워크가 k=0인 경우를
-#       자동으로 처리하도록 설계되었기 때문에 수정할 필요가 없습니다.
-#       (예: Y가 없으면 입력으로 사용하지 않고, 시뮬레이션 시 헤징항을 계산하지 않음)
-#
 class DirectPolicy(nn.Module):
     """정책 신경망입니다."""
     def __init__(self):
@@ -101,7 +116,7 @@ class DirectPolicy(nn.Module):
     def forward(self, **states_dict):
         states_to_cat = [states_dict['X'], states_dict['TmT']]
         # Y가 없으면 이 부분은 실행되지 않음
-        if 'Y' in states_dict and states_dict['Y'] is not None:
+        if 'Y' in states_dict and states_dict['Y'] is not None and k > 0:
             states_to_cat.append(states_dict['Y'])
         x_in = torch.cat(states_to_cat, dim=1)
         u = self.net(x_in)

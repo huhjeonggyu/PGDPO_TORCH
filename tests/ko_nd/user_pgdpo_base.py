@@ -1,7 +1,7 @@
 # user_pgdpo_base.py
 # 역할: 다차원 모델의 모든 사용자 정의 요소를 설정합니다.
 #       (1) 모델 차원 및 파라미터, (2) 정책 신경망, (3) 시뮬레이션 동역학
-
+import os
 import math
 import numpy as np
 import torch
@@ -11,21 +11,42 @@ from scipy.stats import dirichlet
 # ver2 프레임워크와 연동될 분석적 해법 모듈 import
 from closed_form_ref import precompute_ABC, ClosedFormPolicy
 
+# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
+
+# 1. 모델 고유의 기본값을 설정합니다.
+d = 5
+k = 3
+epochs = 200
+batch_size = 1024
+lr = 1e-4
+seed = 7
+
+# 2. 환경변수가 존재하면 기본값을 덮어씁니다.
+d = int(os.getenv("PGDPO_D", d))
+k = int(os.getenv("PGDPO_K", k))
+epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
+batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
+lr = float(os.getenv("PGDPO_LR", lr))
+seed = int(os.getenv("PGDPO_SEED", seed))
+
+# --- 블록 끝 ---
+
+
 # ==============================================================================
 # ===== (A) 사용자 정의 영역: 모델 차원, 파라미터, 하이퍼파라미터 =====
 # ==============================================================================
 
 # --------------------------- Model Dimensions ---------------------------
 # d: 자산 수, k: 팩터 수
-d = 5
-k = 3
+# d = 5 <-- 상단 블록에서 제어
+# k = 3 <-- 상단 블록에서 제어
 DIM_X = 1      # 자산 X는 부(wealth)를 의미하므로 1차원
 DIM_Y = k      # 외생 변수 Y는 k개의 팩터
 DIM_U = d      # 제어 u는 d개 자산에 대한 투자 비율
 
 # --------------------------- Config ---------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-seed = 7 # pgdpo_base.py에서 이 변수를 사용해 실제 시드를 설정
+# seed = 7 # pgdpo_base.py에서 이 변수를 사용해 실제 시드를 설정 <-- 상단 블록에서 제어
 
 # --------------------------- Market & Utility Parameters ---------------------------
 r = 0.03
@@ -41,9 +62,9 @@ u_cap = 10.
 lb_X  = 1e-5
 
 # --------------------------- Training Hyperparameters ---------------------------
-epochs     = 200
-batch_size = 1024
-lr         = 1e-4
+# epochs     = 200 <-- 상단 블록에서 제어
+# batch_size = 1024 <-- 상단 블록에서 제어
+# lr         = 1e-4 <-- 상단 블록에서 제어
 
 # --------------------------- Evaluation Parameters ---------------------------
 N_eval_states = 2000
@@ -59,38 +80,44 @@ def _generate_market_params(d, k, r, dev, seed=None):
         np.random.seed(seed)
 
     # 팩터 동역학 파라미터 (k x k, k)
-    kappa_Y = torch.diag(torch.linspace(2.0, 2.0 + (k-1)*0.5, k))
-    theta_Y = torch.linspace(0.2, 0.4, k)
-    sigma_Y = torch.diag(torch.linspace(0.3, 0.5, k))
+    kappa_Y = torch.diag(torch.linspace(2.0, 2.0 + (k-1)*0.5, k)) if k > 0 else torch.empty(0,0)
+    theta_Y = torch.linspace(0.2, 0.4, k) if k > 0 else torch.empty(0)
+    sigma_Y = torch.diag(torch.linspace(0.3, 0.5, k)) if k > 0 else torch.empty(0,0)
 
     # 자산별 파라미터 (d, d x k)
     sigma = torch.linspace(0.2, 0.4, d)
     # ===== [핵심 수정 2] =====
     # Scipy 난수 생성에 random_state를 명시하여 재현성 보장
-    alpha_np = dirichlet.rvs([1.0] * k, size=d, random_state=seed)
+    alpha_np = dirichlet.rvs([1.0] * k, size=d, random_state=seed) if k > 0 else np.zeros((d,0))
     alpha = torch.tensor(alpha_np, dtype=torch.float32)
 
     # 상관관계 구조 (d x d, k x k, d x k)
     beta_corr = torch.empty(d).uniform_(-0.8, 0.8)
     Psi = torch.outer(beta_corr, beta_corr); Psi.fill_diagonal_(1.0)
     
-    Z_Y = torch.randn(k, max(1, k)); corr_Y = Z_Y @ Z_Y.T
-    d_inv_sqrt_Y = torch.diag(1.0 / torch.sqrt(torch.diag(corr_Y).clamp(min=1e-8)))
-    Phi_Y = d_inv_sqrt_Y @ corr_Y @ d_inv_sqrt_Y; Phi_Y.fill_diagonal_(1.0)
-
-    rho_Y = torch.empty(d, k).uniform_(-0.2, 0.2)
+    if k > 0:
+        Z_Y = torch.randn(k, max(1, k)); corr_Y = Z_Y @ Z_Y.T
+        d_inv_sqrt_Y = torch.diag(1.0 / torch.sqrt(torch.diag(corr_Y).clamp(min=1e-8)))
+        Phi_Y = d_inv_sqrt_Y @ corr_Y @ d_inv_sqrt_Y; Phi_Y.fill_diagonal_(1.0)
+        rho_Y = torch.empty(d, k).uniform_(-0.2, 0.2)
+    else:
+        Phi_Y = torch.empty(0,0)
+        rho_Y = torch.empty(d,0)
 
     # 전체 상관 행렬 (Positive-Definite 보정 포함)
     block_corr = torch.zeros((d + k, d + k), dtype=torch.float32)
     block_corr[:d, :d], block_corr[d:, d:] = Psi, Phi_Y
-    block_corr[:d, d:], block_corr[d:, :d] = rho_Y, rho_Y.T
+    if k > 0:
+        block_corr[:d, d:], block_corr[d:, :d] = rho_Y, rho_Y.T
     
     eigvals = torch.linalg.eigvalsh(block_corr)
     if eigvals.min() < 1e-6:
         block_corr += (abs(eigvals.min()) + 1e-4) * torch.eye(d + k)
         D_inv_sqrt = torch.diag(1.0 / torch.sqrt(torch.diag(block_corr)))
         block_corr = D_inv_sqrt @ block_corr @ D_inv_sqrt
-        Psi, Phi_Y, rho_Y = block_corr[:d, :d], block_corr[d:, d:], block_corr[:d, d:]
+        Psi = block_corr[:d, :d]
+        if k > 0:
+            Phi_Y, rho_Y = block_corr[d:, d:], block_corr[:d, d:]
 
     params = {
         'kappa_Y': kappa_Y, 'theta_Y': theta_Y, 'sigma_Y': sigma_Y,
@@ -101,7 +128,7 @@ def _generate_market_params(d, k, r, dev, seed=None):
     params['block_corr'] = block_corr
     params['cholesky_L'] = torch.linalg.cholesky(params['block_corr'])
     
-    return {k: v.to(dev) for k, v in params.items()}
+    return {p_key: v.to(dev) for p_key, v in params.items()}
 
 # 파라미터 생성 실행
 params = _generate_market_params(d, k, r, device, seed)
@@ -111,9 +138,13 @@ alpha, sigma, kappa_Y, theta_Y, sigma_Y, rho_Y, Psi, Phi_Y = [params[key] for ke
 Sigma, Sigma_inv, block_corr, cholesky_L = params['Sigma'], params['Sigma_inv'], params['block_corr'], params['cholesky_L']
 
 # Y의 평균 범위를 계산 (상태 샘플링에 사용)
-Y_min_vec = theta_Y - 3 * torch.diag(sigma_Y)
-Y_max_vec = theta_Y + 3 * torch.diag(sigma_Y)
-Y0_range = (Y_min_vec, Y_max_vec)
+if k > 0:
+    Y_min_vec = theta_Y - 3 * torch.diag(sigma_Y)
+    Y_max_vec = theta_Y + 3 * torch.diag(sigma_Y)
+    Y0_range = (Y_min_vec, Y_max_vec)
+else:
+    Y0_range = None
+
 
 # ==============================================================================
 # ===== (B) 사용자 정의 영역: 정책 네트워크 및 모델 동역학 =====
@@ -134,7 +165,7 @@ class DirectPolicy(nn.Module):
 
     def forward(self, **states_dict):
         states_to_cat = [states_dict['X'], states_dict['TmT']]
-        if 'Y' in states_dict:
+        if 'Y' in states_dict and k > 0:
             states_to_cat.append(states_dict['Y'])
         x_in = torch.cat(states_to_cat, dim=1)
         u = self.net(x_in)
@@ -189,7 +220,7 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
             Y_drift = (theta_Y - Y) @ kappa_Y.T
             dBY = (sigma_Y @ ZY[:, i, :].T).T
             Y = Y + Y_drift * dt + dBY * dt.sqrt()
-        else:
+        else: # Merton case k=0
             drift_term = r + (u * alpha).sum(1, keepdim=True)
             var_term = torch.einsum('bi,bi->b', u @ Sigma, u).view(-1, 1)
 
@@ -209,6 +240,11 @@ class WrappedCFPolicy(nn.Module):
 
 def build_closed_form_policy():
     """분석적 해를 계산하고, ver2 프레임워크와 호환되는 정책 모듈을 빌드합니다."""
+    if k == 0: # Merton case
+        u_star = ((1.0 / gamma) * (torch.linalg.inv(Sigma) @ alpha.T)).T if alpha.numel() > 0 else torch.zeros(d, device=device)
+        from mt_nd.user_pgdpo_base import WrappedCFPolicy as MertonCF
+        return MertonCF(u_star), None
+
     ode_solution = precompute_ABC(params, T, gamma)
     cf_policy = ClosedFormPolicy(ode_solution, params, T, gamma, u_cap).to(device)
     return WrappedCFPolicy(cf_policy), ode_solution
