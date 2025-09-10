@@ -1,9 +1,9 @@
 # core/pgdpo_run.py
-# 역할: Variance-Reduced 러너 (Antithetic + Richardson)와
+# 역할: Variance-Reduced 러너 (Antithetic)와
 #       P-PGDPO 사영 평가(런타임 버전) + 시각화/로그 저장(outdir)
 # 규칙:
-#   - 학습/평가용 simulate_run: antithetic + Richardson (VR 고정)
-#   - 코스테이트 추정: antithetic only (±Z 평균), Richardson 불사용
+#   - 학습/평가용 simulate_run: antithetic 
+#   - 코스테이트 추정: antithetic (±Z 평균)
 
 from __future__ import annotations
 
@@ -35,8 +35,7 @@ from viz import (
 
 # ------------------------------------------------------------
 # Variance-Reduced 시뮬레이터 (학습/평가 공용)
-#   - coarse(m), fine(2m) 각각 antithetic 평균
-#   - Richardson: 2*U_f - U_c
+#   - antithetic 평균
 # ------------------------------------------------------------
 def simulate_run(
     policy: nn.Module,
@@ -46,7 +45,7 @@ def simulate_run(
     seed_local: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Variance-reduced estimator for U via antithetic + Richardson.
+    Variance-reduced estimator for U via antithetic.
     항상 pgdpo_base.simulate(...)와 pgdpo_base._draw_base_normals(...)를 사용한다.
     """
     # 상태 샘플링
@@ -57,25 +56,15 @@ def simulate_run(
         else initial_states_dict
     )
 
-    # coarse (m) with antithetic
     ZX_c, ZY_c = _draw_base_normals(B, m, rng)
     U_c_p = simulate(policy, B, initial_states_dict=states, random_draws=(+ZX_c, +ZY_c), m_steps=m)
     U_c_m = simulate(policy, B, initial_states_dict=states, random_draws=(-ZX_c, -ZY_c), m_steps=m)
     U_c = 0.5 * (U_c_p + U_c_m)
 
-    # fine (2m) with antithetic (seed offset)
-    rng_f = make_generator((seed_local or 0) + 8191)
-    ZX_f, ZY_f = _draw_base_normals(B, 2 * m, rng_f)
-    U_f_p = simulate(policy, B, initial_states_dict=states, random_draws=(+ZX_f, +ZY_f), m_steps=2 * m)
-    U_f_m = simulate(policy, B, initial_states_dict=states, random_draws=(-ZX_f, -ZY_f), m_steps=2 * m)
-    U_f = 0.5 * (U_f_p + U_f_m)
-
-    # Richardson extrapolation
-    return 2.0 * U_f - U_c
-
+    return U_c
 
 # ------------------------------------------------------------
-# 코스테이트 추정: antithetic-only (±Z 평균), Richardson 미사용
+# 코스테이트 추정: antithetic-only (±Z 평균)
 # ------------------------------------------------------------
 def estimate_costates_anti(
     policy_net: nn.Module,
@@ -86,8 +75,7 @@ def estimate_costates_anti(
 ) -> Dict[str, torch.Tensor]:
     """
     코스테이트 추정 (JX, JXX, JXY):
-      - antithetic only (±Z 평균)
-      - Richardson(2m vs m) 불사용
+      - antithetic (±Z 평균)
     """
     B = next(iter(initial_states.values())).size(0)
 
@@ -232,7 +220,7 @@ def print_policy_rmse_and_samples_run(
                     tile_states = {k: v[s:e] for k, v in states_dict.items()}
                     u_pp_run[s:e] = ppgdpo_u_run(
                         pol_s1, tile_states, repeats, sub_batch,
-                        seed_eval=(seed_eval if seed_eval is not None else 0) + s
+                        seed_eval=(seed_eval if seed_eval is not None else 0)
                     )
                 break  # 성공했으면 종료
             except RuntimeError as e:

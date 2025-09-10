@@ -49,7 +49,7 @@ if torch.cuda.is_available():
 
 # ================== (B) Problem parameters ==================
 T = 1.0
-m = 20                                 # N steps (dt = T/m)
+m = 40                                 # N steps (dt = T/m)
 dt_const = T / m
 
 alpha_val = 0.3                         # R = alpha * I
@@ -97,7 +97,7 @@ class DirectPolicy(nn.Module):
     def __init__(self):
         super().__init__()
         state_dim = DIM_X + DIM_Y + 1   # = d + 1
-        hidden = 64                     # 가볍고 d=1e4에도 무난한 폭
+        hidden = 128                     
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
@@ -176,13 +176,11 @@ def build_closed_form_policy():
 
 # ==========================================================================================
 
-# (A) N_agg(t) 레퍼런스 신호 제공
 def ref_signals_fn(t_np: np.ndarray) -> dict:
-    # t_np: (steps,) numpy array
-    # 여러분의 aggregate_net_load(t)를 그대로 사용
     import numpy as np
-    # torch 없이 순수 numpy 버전 하나 둡니다 (또는 torch->numpy 변환)
-    return {"Nagg": 2.5 * np.sin(2 * np.pi * t_np / float(T))}
+    capacity_per_battery = 0.25
+    max_power = d * capacity_per_battery
+    return {"Nagg": max_power * np.sin(2 * np.pi * t_np / float(T))}
 
 # (B) R-메트릭 정보 제공 (R = alpha * I 가 기본)
 R_INFO = {"alpha": float(alpha_val)}   # 일반 R을 쓰면 {"R_diag": diag_list} 또는 {"R": R_matrix}
@@ -194,8 +192,9 @@ def get_traj_schema():
             "U": {"dim": int(DIM_U), "labels": [f"u_{i+1}"   for i in range(int(DIM_U))]},
         },
         "views": [
-            {"name": "Tracking",    "mode": "tracking_vpp", "ylabel": "Power"},      # Nagg vs sum u
-            {"name": "U_Rnorm",     "mode": "u_rnorm",      "ylabel": "||u||_R"},    # R-노름
+            {"name": "Tracking",    "mode": "tracking_vpp", "ylabel": "Power"},
+            # --- ✨ 아래 "block" 키 추가 ---
+            {"name": "U_Rnorm",     "mode": "u_rnorm", "block": "U", "ylabel": "||u||_R"},
         ],
         "sampling": {"Bmax": 5}
     }

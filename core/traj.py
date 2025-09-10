@@ -14,7 +14,8 @@ from pgdpo_base import (
     sample_initial_states, simulate,
 )
 
-PP_MODE = os.getenv('PP_MODE','runner').lower()
+#PP_MODE = os.getenv('PP_MODE','runner').lower()
+PP_MODE = os.getenv('PP_MODE','direct').lower()
 _HAS_RUNNER, _HAS_DIRECT = False, False
 try: from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
 except ImportError: pass
@@ -103,20 +104,54 @@ def _simulate_and_record(policy: nn.Module, B: int, rng: torch.Generator, sync_t
     return recorder.stacked()
 
 def _plot_lines(x_time, series_map, title, ylabel, save_path):
-    fig, ax = plt.subplots(figsize=(7.5, 4.0)); styles = {"cf": "-", "learn": "--", "pp": ":"}
+    fig, ax = plt.subplots(figsize=(7.5, 4.0))
+
+    # 선/마커 스타일(겹침 방지)
+    STYLE = {
+        "cf":    {"ls": "-",  "marker": None, "lw": 2.4, "zorder": 3},
+        "pp":    {"ls": "-.", "marker": "o",  "lw": 1.9, "ms": 3.0, "markevery": None, "zorder": 4},
+        "learn": {"ls": "--", "marker": "s",  "lw": 1.9, "ms": 3.0, "markevery": None, "zorder": 4},
+    }
+
+    # 마커 밀도 자동 설정(대략 10개 마커)
+    n = len(x_time)
+    default_markevery = max(1, n // 10)
+
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     used = set()
+
     for i, (label, policies) in enumerate(sorted(series_map.items())):
         color = colors[i % len(colors)]
         for policy, data in sorted(policies.items()):
-            key = label if "N_agg" in label else f"{label} — {policy}"
-            if key in used: continue
-            ls = "-" if "N_agg" in label else styles.get(policy, "-")
-            lab = label if "N_agg" in label else f"{label} — {policy}"
-            ax.plot(x_time, data, linestyle=ls, color=color, label=lab)
+            # 표시용 라벨/중복키를 먼저 만든다
+            is_ref = ("N_agg" in label)
+            disp_label = label if is_ref else f"{label} — {policy}"
+            key = label if is_ref else disp_label
+            if key in used:
+                continue
+
+            # 스타일 선택
+            st = STYLE.get("cf" if is_ref else policy, {"ls": "-", "lw": 2.0})
+            ls = st.get("ls", "-")
+            marker = st.get("marker", None)
+            lw = st.get("lw", 2.0)
+            z = st.get("zorder", 2)
+            ms = st.get("ms", None)
+            me = st.get("markevery", default_markevery if marker else None)
+
+            ax.plot(
+                x_time, data,
+                linestyle=ls, color=color, label=disp_label, lw=lw, zorder=z,
+                marker=marker, ms=ms, markevery=me
+            )
             used.add(key)
-    ax.set(xlabel="Time", ylabel=ylabel, title=title); ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    ax.legend(loc="best", fontsize=9); fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
+
+    ax.set(xlabel="Time", ylabel=ylabel, title=title)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax.legend(loc="best", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 def _series_for_view(view: Dict[str, Any], traj_np: Dict[str, Any], Bsel: List[int]) -> Tuple[np.ndarray, List[np.ndarray], List[str]]:
     block_name = view.get("block", "X")
@@ -132,16 +167,44 @@ def _series_for_view(view: Dict[str, Any], traj_np: Dict[str, Any], Bsel: List[i
 
 def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str | None = None) -> Optional[Tuple[np.ndarray, List[np.ndarray], List[str]]]:
     mode = (view.get("mode","") or "").lower()
-    if mode != "tracking_vpp": return None
-    U = _to_np(traj_np["U"])[Bsel]
-    x_time = _linspace_time(U.shape[1])
-    u_total_power = U.sum(axis=-1).mean(axis=0)
-    series, labels = [u_total_power], ["Output (sum u)"]
-    if _REF_FN and policy_tag == "cf":
-        n_agg_line = np.asarray(_REF_FN(x_time)["Nagg"]).reshape(-1)
-        series.append(n_agg_line)
-        labels.append("N_agg (ref)")
-    return x_time, series, labels
+    
+    # --- "u_rnorm" 처리 로직 ---
+    if mode == "u_rnorm":
+        # traj_np 딕셔너리에서 'U' 블록의 데이터를 가져옴
+        U = _to_np(traj_np["U"])[Bsel]  # (B, T, d) 형태의 numpy 배열
+        x_time = _linspace_time(U.shape[1])
+        
+        # user_pgdpo_base.py의 _R_INFO 에서 alpha 값을 가져옴
+        alpha = _R_INFO.get("alpha", 0.0)
+        if alpha <= 0:
+            print("[WARN] Alpha for R-norm is not positive. Norm will be zero.")
+            # alpha가 0이거나 음수이면 norm은 0
+            r_norm_series = np.zeros(U.shape[1])
+        else:
+            # ||u||_R = sqrt(alpha * sum(u_i^2)) = sqrt(alpha) * L2_norm(u)
+            # 1. 각 시간 스텝(axis=1)별로 d차원 u 벡터의 L2 norm을 계산 (axis=-1)
+            # 2. 배치(B)에 대해 평균을 냄 (axis=0)
+            r_norm_series = np.sqrt(alpha) * np.linalg.norm(U, axis=-1).mean(axis=0)
+        
+        # [시간축, [계산된 시리즈], [범례 레이블]] 형태로 반환
+        return x_time, [r_norm_series], [view.get("block", "U")]
+    # --- 로직 끝 ---
+
+    # --- 기존 "tracking_vpp" 처리 로직 ---
+    if mode == "tracking_vpp":
+        U = _to_np(traj_np["U"])[Bsel]
+        x_time = _linspace_time(U.shape[1])
+        u_total_power = U.sum(axis=-1).mean(axis=0)
+        series, labels = [u_total_power], ["Output (sum u)"]
+        if _REF_FN and policy_tag == "cf":
+            # N_agg 레퍼런스 신호가 있으면 함께 그림
+            n_agg_line = np.asarray(_REF_FN(x_time)["Nagg"]).reshape(-1)
+            series.append(n_agg_line)
+            labels.append("N_agg (ref)")
+        return x_time, series, labels
+
+    # 처리할 모드가 없으면 None 반환
+    return None
 
 def _series_for_view_wrapper(view, traj_np, Bsel, policy_tag=None):
     if (view.get("name","").lower().startswith("tracking")):
