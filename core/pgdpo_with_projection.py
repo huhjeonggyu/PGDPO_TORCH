@@ -154,9 +154,8 @@ def ppgdpo_u_direct(
 ) -> torch.Tensor:
     with torch.enable_grad():
         costates = estimate_costates(policy_s1, states, repeats, sub_batch, seed_eval=seed_eval)
-        u = project_pmp(costates, states)
-    return u.detach()
-
+        u = project_pmp(costates, states)         # 기존 사영
+        return u.detach()
 
 def _divisors_desc(n: int):
     return sorted([d for d in range(1, n + 1) if n % d == 0], reverse=True)

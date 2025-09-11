@@ -14,8 +14,7 @@ from pgdpo_base import (
     sample_initial_states, simulate,
 )
 
-#PP_MODE = os.getenv('PP_MODE','runner').lower()
-PP_MODE = os.getenv('PP_MODE','direct').lower()
+PP_MODE = os.getenv('PP_MODE','runner').lower()
 _HAS_RUNNER, _HAS_DIRECT = False, False
 try: from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
 except ImportError: pass
@@ -170,25 +169,24 @@ def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str |
     
     # --- "u_rnorm" 처리 로직 ---
     if mode == "u_rnorm":
-        # traj_np 딕셔너리에서 'U' 블록의 데이터를 가져옴
-        U = _to_np(traj_np["U"])[Bsel]  # (B, T, d) 형태의 numpy 배열
+        U = _to_np(traj_np["U"])[Bsel]
         x_time = _linspace_time(U.shape[1])
         
-        # user_pgdpo_base.py의 _R_INFO 에서 alpha 값을 가져옴
-        alpha = _R_INFO.get("alpha", 0.0)
-        if alpha <= 0:
-            print("[WARN] Alpha for R-norm is not positive. Norm will be zero.")
-            # alpha가 0이거나 음수이면 norm은 0
-            r_norm_series = np.zeros(U.shape[1])
-        else:
-            # ||u||_R = sqrt(alpha * sum(u_i^2)) = sqrt(alpha) * L2_norm(u)
-            # 1. 각 시간 스텝(axis=1)별로 d차원 u 벡터의 L2 norm을 계산 (axis=-1)
-            # 2. 배치(B)에 대해 평균을 냄 (axis=0)
-            r_norm_series = np.sqrt(alpha) * np.linalg.norm(U, axis=-1).mean(axis=0)
+        # ✨ R 행렬을 직접 사용하는 새로운 로직 추가
+        if "R" in _R_INFO:
+            R = _R_INFO["R"].cpu().numpy() # (d, d)
+            # u'Ru 계산: (B, T, 1, d) @ (d, d) @ (B, T, d, 1) -> (B, T, 1, 1)
+            u_Ru = np.einsum('bti,ij,btj->bt', U, R, U)
+            r_norm_series = np.sqrt(u_Ru).mean(axis=0)
+        else: # 기존 alpha 방식 (하위 호환성)
+            alpha = _R_INFO.get("alpha", 0.0)
+            if alpha <= 0:
+                print("[WARN] Alpha for R-norm is not positive or R matrix not found. Norm will be zero.")
+                r_norm_series = np.zeros(U.shape[1])
+            else:
+                r_norm_series = np.sqrt(alpha) * np.linalg.norm(U, axis=-1).mean(axis=0)
         
-        # [시간축, [계산된 시리즈], [범례 레이블]] 형태로 반환
         return x_time, [r_norm_series], [view.get("block", "U")]
-    # --- 로직 끝 ---
 
     # --- 기존 "tracking_vpp" 처리 로직 ---
     if mode == "tracking_vpp":
@@ -197,10 +195,11 @@ def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str |
         u_total_power = U.sum(axis=-1).mean(axis=0)
         series, labels = [u_total_power], ["Output (sum u)"]
         if _REF_FN and policy_tag == "cf":
-            # N_agg 레퍼런스 신호가 있으면 함께 그림
-            n_agg_line = np.asarray(_REF_FN(x_time)["Nagg"]).reshape(-1)
-            series.append(n_agg_line)
-            labels.append("N_agg (ref)")
+            # ✨ ref_signals_fn가 반환하는 모든 레퍼런스 신호를 함께 그림
+            ref_signals = _REF_FN(x_time)
+            for key, values in ref_signals.items():
+                series.append(np.asarray(values).reshape(-1))
+                labels.append(f"{key} (ref)")
         return x_time, series, labels
 
     # 처리할 모드가 없으면 None 반환

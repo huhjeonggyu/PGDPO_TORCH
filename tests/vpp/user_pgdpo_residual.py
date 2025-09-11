@@ -1,26 +1,21 @@
 # tests/vpp/user_pgdpo_residual.py
-# Myopic-only policy module (used as baseline and for residual learning base)
-
 import torch
 import torch.nn as nn
-from user_pgdpo_base import d, N_agg, T, device, alpha_val, u_min, u_max, use_soft_clip, soft_k
-
-def soft_clip(u, lo=-1.0, hi=1.0, k=3.0):
-    mid = 0.5*(hi+lo); half = 0.5*(hi-lo)
-    return mid + half*torch.tanh(k*(u-mid))
-
-def _clip_u(u):
-    return soft_clip(u, u_min, u_max, soft_k) if use_soft_clip else torch.clamp(u, u_min, u_max)
+# ✨ user_pgdpo_base에서 필요한 변수들을 가져옴
+from user_pgdpo_base import d, price_fn, T, device, R_diag, u_min, u_max
 
 class MyopicPolicy(nn.Module):
     """
-    u_myopic(t) = N_agg(t)/(alpha + d) * 1
-    (Matches analytical policy from the stable single-file code.)
+    ✨ 수정된 Myopic 정책: u_i(t) = P(t) / R_i
     """
     def __init__(self):
         super().__init__()
-        self.register_buffer("ones_d_T", torch.ones(1, d, device=device))
+        # R_diag를 (1,d) 형태로 만들어 브로드캐스팅 준비
+        self.register_buffer("inv_R_diag", 1.0 / R_diag.view(1, -1))
+
     def forward(self, **states_dict) -> torch.Tensor:
-        t = T - states_dict['TmT']          # (B,1)
-        u = (N_agg(t) / (alpha_val + d)) * self.ones_d_T
-        return _clip_u(u)
+        t = T - states_dict['TmT']  # (B,1)
+        price = price_fn(t)         # (B,1)
+        # (B,1) * (1,d) -> (B,d) (브로드캐스팅)
+        u = price * self.inv_R_diag
+        return torch.clamp(u, u_min, u_max)

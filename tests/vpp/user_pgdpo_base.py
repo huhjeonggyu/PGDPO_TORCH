@@ -1,134 +1,94 @@
 # tests/vpp/user_pgdpo_base.py
-# VPP benchmark (based on the stable single-file script), split into base/policy/sim
-# Exposes all symbols expected by core/pgdpo_base.py
 import os
 import torch
 import torch.nn as nn
 import numpy as np
 
 # --- 모델별 설정 및 환경변수 오버라이드 블록 ---
-
-# 1. 모델 고유의 기본값을 설정합니다.
 d = 10
-k = 0  # ✨ VPP 모델은 k=0 으로 고정되어야 합니다.
+k = 0
 epochs = 500
 batch_size = 1024
 lr = 1e-4
 seed = 42
 
-# 2. 변경 가능한 파라미터만 환경변수로부터 덮어씁니다.
 d = int(os.getenv("PGDPO_D", d))
 epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
 batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
 lr = float(os.getenv("PGDPO_LR", lr))
 seed = int(os.getenv("PGDPO_SEED", seed))
-# k는 이 모델의 정의에 따라 0으로 유지됩니다.
-
 # --- 블록 끝 ---
 
-
 # ================== (A) Dimensions & global config ==================
-# d = 10                              # number of batteries (state dim) <-- 상단 블록에서 제어
-# k = 0                               # no exogenous Y <-- 상단 블록에서 고정
 DIM_X, DIM_Y, DIM_U = d, k, d
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CRN_SEED_EU = 777
+N_eval_states = 2048
 
-# ---- Required training hyperparams (exported for core) ----
-# epochs      = 500 <-- 상단 블록에서 제어
-# batch_size  = 1024 <-- 상단 블록에서 제어
-# lr          = 1e-4 <-- 상단 블록에서 제어
-# seed        = 42          # used by core for seeding <-- 상단 블록에서 제어
-CRN_SEED_EU = 777         # common random number seed for eval (exported)
-N_eval_states = 2048      # eval batch size (exported)
-
-# Apply module-level seed immediately
 torch.manual_seed(seed); np.random.seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-# ================== (B) Problem parameters ==================
+# ================== (B) Problem parameters (수정됨) ==================
 T = 1.0
-m = 40                                 # N steps (dt = T/m)
+m = 40
 dt_const = T / m
 
-alpha_val = 0.3                         # R = alpha * I
-R_matrix = torch.eye(d, device=device) * alpha_val
+# ✨ 1. (신규) 상태 추종 페널티 가중치
+# 각 배터리의 SoC가 목표치(x_target)에서 벗어날 때 부과되는 페널티의 강도
+state_penalty_weight = 5.0 
+x_target = 0.5
 
-# Myopic analytical control tracks this net load
-def N_agg(t_tensor: torch.Tensor) -> torch.Tensor:
-    # 배터리 1대당 평균 0.25의 출력을 낸다고 가정
-    capacity_per_battery = 0.25
-    max_power = d * capacity_per_battery
-    return max_power * torch.sin(2 * torch.pi * t_tensor / T)
+# 이종(Heterogeneous) 비용 파라미터 R_i
+R_diag = torch.empty(d, device=device).uniform_(0.2, 1.0)
+R_matrix = torch.diag(R_diag)
 
-# Control bounds (optional; used by our policy if soft-clip on)
-u_min, u_max = -10.0, 10.0
-use_soft_clip  = False
-soft_k = 3.0
+# 변동성 있는 전력 가격 모델 P(t)
+def price_fn(t_tensor: torch.Tensor) -> torch.Tensor:
+    price = 25 * torch.sin(2 * torch.pi * t_tensor / T) + \
+            15 * torch.sin(4 * torch.pi * t_tensor / T) + 30
+    return price.clamp_min(0.1)
 
-def soft_clip(u, lo=-1.0, hi=1.0, k=3.0):
-    mid = 0.5 * (hi + lo); half = 0.5 * (hi - lo)
-    return mid + half * torch.tanh(k * (u - mid))
+# 이종(Heterogeneous) 노이즈 파라미터
+vols_W = torch.empty(d, device=device).uniform_(0.3, 0.7)
 
-def clip_u(u):
-    return soft_clip(u, u_min, u_max, soft_k) if use_soft_clip else torch.clamp(u, u_min, u_max)
+u_min, u_max = -1000.0, 1000.0
 
-# ================== (C) One-factor correlated noise ==================
-# Corr ≈ beta beta^T + diag(1 - beta^2); vols ~ U[0.3, 0.7]
-beta_corr = torch.empty(d, device=device).uniform_(-0.8, 0.8)
-vols_W    = torch.empty(d, device=device).uniform_(0.3, 0.7)
-sqrt_idio = torch.sqrt(torch.clamp(1.0 - beta_corr**2, min=1e-8))
-
-def draw_correlated_dW(B: int, dt_val: float, dtype=torch.float16):
-    scale = torch.sqrt(torch.tensor(dt_val, device=device, dtype=dtype))
-    Z0 = torch.randn(B, 1, device=device, dtype=dtype)   # common factor
-    Zi = torch.randn(B, d, device=device, dtype=dtype)   # idiosyncratic
-    dW = (beta_corr.to(dtype) * Z0 + sqrt_idio.to(dtype) * Zi) * (vols_W.to(dtype) * scale)
-    return dW.to(torch.float32)
+def draw_dW(B: int, dt_val: float):
+    scale = torch.sqrt(torch.tensor(dt_val, device=device))
+    return torch.randn(B, d, device=device) * vols_W * scale
 
 class DirectPolicy(nn.Module):
-    """
-    Pure neural network policy:
-      input  : concat([X, TmT]) with shape (B, d+1)
-      output : u in R^d with shape (B, d)
-    No myopic baseline, no residual split, no clamp.
-    """
     def __init__(self):
         super().__init__()
-        state_dim = DIM_X + DIM_Y + 1   # = d + 1
-        hidden = 128                     
-
+        state_dim = DIM_X + DIM_Y + 1
+        hidden = 128
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden),    nn.ReLU(),
-            nn.Linear(hidden, DIM_U)      # -> (B, d)
+            nn.Linear(hidden, DIM_U)
         )
-
-        # 안정적인 시작을 위해 마지막 레이어는 0 근처에서 시작
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, **states_dict) -> torch.Tensor:
-        X   = states_dict["X"]    # (B, d)
-        TmT = states_dict["TmT"]  # (B, 1)
-        x_in = torch.cat([X, TmT], dim=1)  # (B, d+1)
-        u = self.net(x_in)                 # (B, d)
-        return u
+        X   = states_dict["X"]
+        TmT = states_dict["TmT"]
+        x_in = torch.cat([X, TmT], dim=1)
+        u = self.net(x_in)
+        return torch.clamp(u, u_min, u_max)
 
-# ================== (E) Simulator (PG-DPO core calls this) ==================
+# ================== (E) Simulator (수정됨) ==================
 def sample_initial_states(B: int, *, rng: torch.Generator | None = None):
-    # X0 ~ U(0.2, 0.8), TmT0 ~ U(0, T)
     X0 = torch.rand((B, DIM_X), device=device, generator=rng) * 0.6 + 0.2
     TmT0 = torch.rand((B, 1), device=device, generator=rng) * T
-    # core expects (states_dict, dt_vec)
-    dt_vec = torch.full_like(TmT0, dt_const)  # constant dt = T/m
+    dt_vec = torch.full_like(TmT0, dt_const)
     return {'X': X0, 'TmT': TmT0}, dt_vec
 
 def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, random_draws=None, m_steps=None):
     """
-    Returns reward = - (running cost + terminal cost).
-    Running cost per step: (N_agg(t) - sum u)^2 + alpha * ||u||^2.
+    ✨ 목표 함수에 '상태 추종 페널티' 추가
+    - Reward per step: (Price * sum(u)) - 0.5 * u'Ru - 0.5 * weight * ||x - x_target||^2
     """
     m_eff = m_steps if m_steps is not None else m
     if initial_states_dict is None:
@@ -136,65 +96,79 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     else:
         states, dt = initial_states_dict, torch.full_like(initial_states_dict['TmT'], T / float(m_eff))
 
-    X = states['X']                               # (B,d)
-    running_cost = torch.zeros(B, 1, device=device)
+    X = states['X']
+    total_profit = torch.zeros(B, 1, device=device)
 
     for i in range(m_eff):
-        # time bookkeeping consistent with prior tests: t = T - (TmT - i*dt)
-        t_current = T - (states['TmT'] - i * dt)  # (B,1)
+        t_current = T - (states['TmT'] - i * dt)
         current_states = {'X': X, 'TmT': states['TmT'] - i * dt}
-        u = policy(**current_states)              # (B,d)
+        u = policy(**current_states)
 
-        Nagg = N_agg(t_current)                   # (B,1)
-        agg_u = torch.sum(u, dim=1, keepdim=True) # (B,1)
-        cost_step = (Nagg - agg_u).pow(2) + alpha_val * torch.sum(u**2, dim=1, keepdim=True)
-        running_cost += cost_step * dt
+        # 수익 계산 로직
+        price = price_fn(t_current)
+        revenue = price * torch.sum(u, dim=1, keepdim=True)
+        op_cost = 0.5 * torch.einsum('bi,ij,bj->b', u, R_matrix, u).unsqueeze(1)
+        
+        # ✨ 2. (신규) 상태 페널티 계산
+        # 현재 상태 X가 목표치 x_target에서 벗어난 정도에 따라 페널티 부과
+        state_penalty = 0.5 * state_penalty_weight * torch.sum((X - x_target)**2, dim=1, keepdim=True)
 
-        # SDE step (one-factor correlated noise)
-        dW = draw_correlated_dW(B, float(dt_const))
-        X = X - u * dt + dW                       # (B,d)
-        # (필요 시 상태 clamp를 켤 수 있지만, 기본은 무제약)
-        # X = torch.clamp(X, 0.0, 1.0)
+        # ✨ 3. (수정) 최종 단계별 보상 계산
+        profit_step = revenue - op_cost - state_penalty
+        total_profit += profit_step * dt
 
-    terminal_cost = torch.zeros_like(running_cost)  # no terminal penalty in this baseline
-    total_cost = running_cost + terminal_cost
-    return -total_cost
+        # SDE step
+        dW = draw_dW(B, float(dt_const))
+        X = X - u * dt + dW
+        # X = torch.clamp(X, 0.0, 1.0) # 필요시 SoC 제약 추가
 
-# ================== (F) Closed-form (myopic) policy for RMSE reference ==================
+    # 프레임워크가 보상(reward)을 최대화하도록 수익(profit)을 직접 반환
+    return total_profit
+
+# ================== (F) Closed-form (수정됨) ==================
 class AnalyticalMyopicPolicy(nn.Module):
-    """u_analytical(t) = N_agg(t)/(alpha + d) * 1 (optionally clipped)."""
+    """
+    ✨ 수정된 해석적 해: u_i(t) = P(t) / R_i (Co-state 무시)
+    """
     def __init__(self):
         super().__init__()
+        # R_diag는 (d,) 형태이므로 (1,d)로 브로드캐스팅 가능하게 만듦
+        self.register_buffer("inv_R_diag", 1.0 / R_diag.view(1, -1))
+
     def forward(self, **states_dict):
         t = T - states_dict['TmT']
-        u = (N_agg(t) / (alpha_val + d)).repeat(1, d)
-        return clip_u(u)
+        price = price_fn(t)
+        # 각 배터리는 자신의 비용(R_i)에만 반응
+        u = price * self.inv_R_diag
+        return torch.clamp(u, u_min, u_max)
 
 def build_closed_form_policy():
-    print("✅ Analytical VPP myopic policy loaded (based on stable script).")
+    print("✅ Analytical VPP myopic policy for HETEROGENEOUS units loaded.")
     return AnalyticalMyopicPolicy().to(device), None
 
-# ==========================================================================================
-
 def ref_signals_fn(t_np: np.ndarray) -> dict:
-    import numpy as np
-    capacity_per_battery = 0.25
-    max_power = d * capacity_per_battery
-    return {"Nagg": max_power * np.sin(2 * np.pi * t_np / float(T))}
+    """
+    비교를 위해 그래프에 함께 표시할 외부 신호(가격)를 반환합니다.
+    """
+    # price_fn은 tensor를 입력받으므로 numpy 배열을 tensor로 변환했다가 다시 변환합니다.
+    price_t = price_fn(torch.from_numpy(t_np).float().to(device))
+    return {"Price": price_t.cpu().numpy()}
 
-# (B) R-메트릭 정보 제공 (R = alpha * I 가 기본)
-R_INFO = {"alpha": float(alpha_val)}   # 일반 R을 쓰면 {"R_diag": diag_list} 또는 {"R": R_matrix}
+R_INFO = {"R": R_matrix}
 
 def get_traj_schema():
+    """
+    어떤 변수를 어떻게 시각화할지 정의하는 스키마를 반환합니다.
+    """
     return {
         "roles": {
             "X": {"dim": int(DIM_X), "labels": [f"SoC_{i+1}" for i in range(int(DIM_X))]},
             "U": {"dim": int(DIM_U), "labels": [f"u_{i+1}"   for i in range(int(DIM_U))]},
         },
         "views": [
-            {"name": "Tracking",    "mode": "tracking_vpp", "ylabel": "Power"},
-            # --- ✨ 아래 "block" 키 추가 ---
-            {"name": "U_Rnorm",     "mode": "u_rnorm", "block": "U", "ylabel": "||u||_R"},
+            # ✨ 새로운 그래프 뷰 정의
+            {"name": "Arbitrage_Strategy", "mode": "tracking_vpp", "ylabel": "Price / Power"},
+            {"name": "U_Rnorm", "mode": "u_rnorm", "block": "U", "ylabel": "||u||_R"},
         ],
         "sampling": {"Bmax": 5}
     }

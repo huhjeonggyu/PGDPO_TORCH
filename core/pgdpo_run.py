@@ -168,8 +168,7 @@ def ppgdpo_u_run(
         # ✅ antithetic-only costate estimator (로컬)
         costates = estimate_costates_anti(policy_s1, states, repeats, sub_batch, seed_eval=seed_eval)
         u = project_pmp(costates, states)
-    return u.detach()
-
+        return u.detach()
 
 def _divisors_desc(n: int):
     return sorted([d for d in range(1, n + 1) if n % d == 0], reverse=True)
