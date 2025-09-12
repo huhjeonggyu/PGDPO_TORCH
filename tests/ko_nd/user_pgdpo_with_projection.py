@@ -8,6 +8,8 @@ from user_pgdpo_base import (
     alpha, sigma, Sigma_inv, rho_Y, sigma_Y, r, gamma, u_cap
 )
 
+PP_NEEDS = ("JX", "JXX", "JXY")
+
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     """
     u*(t, X, Y) = -(1 / (X * J_XX)) · Σ^{-1} · [ J_X · (μ - r) + J_XY · Σ_YX ]

@@ -35,7 +35,7 @@ except Exception as e:
 # 🔴 유저 projector는 필수. 없으면 즉시 오류로 중단.
 try:
     # Must be defined in tests/<model>/user_pgdpo_with_projection.py
-    from user_pgdpo_with_projection import project_pmp  # (costates:dict, states:dict) -> torch.Tensor
+    from user_pgdpo_with_projection import project_pmp, PP_NEEDS
 except Exception as e:
     raise RuntimeError(
         "[core] Required user projector 'project_pmp' not found in user_pgdpo_with_projection.py.\n"
@@ -354,7 +354,7 @@ def main():
         train_fn=train_stage1_base,
         rmse_fn=print_policy_rmse_and_samples_direct,
         train_kwargs={},  # 필요 시 epochs/lr override 가능
-        rmse_kwargs={"repeats": REPEATS, "sub_batch": SUBBATCH, "seed_eval": CRN_SEED_EU},
+        rmse_kwargs={"repeats": REPEATS, "sub_batch": SUBBATCH, "seed_eval": CRN_SEED_EU, "needs" : PP_NEEDS},
     )
 
 if __name__ == "__main__":
@@ -367,5 +367,5 @@ __all__ = [
     "project_pmp",
     "ppgdpo_u_direct",
     "print_policy_rmse_and_samples_direct",
-    "VERBOSE", "SAMPLE_PREVIEW_N"
+    "VERBOSE", "SAMPLE_PREVIEW_N", "PP_NEEDS"
 ]

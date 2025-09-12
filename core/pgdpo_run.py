@@ -25,7 +25,7 @@ from pgdpo_base import (
 
 # with_projection: 반복 관련 상수 + PMP projector + 범용 costate 추정기
 from pgdpo_with_projection import (
-    REPEATS, SUBBATCH, 
+    REPEATS, SUBBATCH, PP_NEEDS,
     project_pmp, estimate_costates,
     VERBOSE, SAMPLE_PREVIEW_N
 )
@@ -308,7 +308,7 @@ def main():
         rmse_fn=print_policy_rmse_and_samples_run,
         seed_train=seed,
         train_kwargs={},  # 필요시 {"epochs_override":..., "lr_override":..., "outdir":...}
-        rmse_kwargs={"repeats": REPEATS, "sub_batch": SUBBATCH, "seed_eval": CRN_SEED_EU},
+        rmse_kwargs={"repeats": REPEATS, "sub_batch": SUBBATCH, "seed_eval": CRN_SEED_EU, "needs" : PP_NEEDS},
     )
 
 

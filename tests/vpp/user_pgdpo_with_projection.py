@@ -3,6 +3,8 @@ import torch
 # ✨ user_pgdpo_base에서 R_diag와 가격 함수를 가져옴
 from user_pgdpo_base import R_diag, price_fn, T
 
+PP_NEEDS = ("JX",)
+
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     """
     ✨ 수정된 PMP 프로젝션 공식 (논문 식 15)
@@ -17,7 +19,6 @@ def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     # 각 차원별로 연산
     # (B,1) + (B,d) -> (B,d) (브로드캐스팅)
     # (B,d) / (d,)    -> (B,d) (브로드캐스팅)
-    #u = (price + JX) / R_diag.view(1, -1)
     u = (price - JX) / R_diag.view(1, -1)
     
     return u
