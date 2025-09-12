@@ -1,286 +1,355 @@
 # core/pgdpo_with_projection.py
-# 역할: "Direct" P-PGDPO (코스테이트 추정 → PMP 사영) 평가/유틸
-# - 호환 래퍼 없이 random_draws를 직접 생성하여 simulate(...)에 전달
-# - 타일/서브배치 재현성: seed_eval + 진행 오프셋 기반 RNG
+# -*- coding: utf-8 -*-
+"""
+P-PGDPO (Projected PG-DPO) core — DIRECT path only
+- Mandatory user projector (project_pmp) import; if missing, raise immediately.
+- Flexible DIRECT costate estimator with injected simulator (user_pgdpo_base.simulate).
+- Direct evaluator with verbose prints (+ sample preview), and a simple standalone test harness.
+"""
 
 from __future__ import annotations
-
-from typing import Optional, Dict
+import os
+import inspect
+from typing import Callable, Dict, Optional, Iterable
 
 import torch
 import torch.nn as nn
 
-from pgdpo_base import (
-    device, N_eval_states,
-    make_generator, run_common, train_stage1_base,
-    sample_initial_states, simulate,
-    CRN_SEED_EU, m, d, k,
-)
-
+# ---------------------------------------------------------------------
+# Mandatory imports from user space
+# ---------------------------------------------------------------------
 try:
-    from user_pgdpo_with_projection import project_pmp
+    # device, eval sampling, CRN seed, initial state sampler
+    from user_pgdpo_base import (
+        device,
+        N_eval_states,
+        CRN_SEED_EU,
+        sample_initial_states,   # (B, rng=None) -> (states_dict, dt_vec)
+    )
 except Exception as e:
-    raise RuntimeError(f"[pgdpo_with_projection] Failed to import symbols from user_pgdpo_with_projection: {e}")    
+    raise RuntimeError(
+        "[core] Could not import required symbols from user_pgdpo_base "
+        "(device, N_eval_states, CRN_SEED_EU, sample_initial_states)."
+    ) from e
 
-from viz import (
-    save_pairwise_scatters, append_metrics_csv, save_overlaid_delta_hists
-)
+# 🔴 유저 projector는 필수. 없으면 즉시 오류로 중단.
+try:
+    # Must be defined in tests/<model>/user_pgdpo_with_projection.py
+    from user_pgdpo_with_projection import project_pmp  # (costates:dict, states:dict) -> torch.Tensor
+except Exception as e:
+    raise RuntimeError(
+        "[core] Required user projector 'project_pmp' not found in user_pgdpo_with_projection.py.\n"
+        "Add:\n"
+        "    def project_pmp(costates: dict, states: dict) -> torch.Tensor:\n"
+        "        ...\n"
+    ) from e
 
+# ---------------------------------------------------------------------
+# Defaults (env-overridable)
+# ---------------------------------------------------------------------
+REPEATS  = int(os.getenv("PGDPO_PP_REPEATS", 2560))
+SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 256))
 
-# 코스테이트 추정 반복 수와 서브배치 크기 (기본값)
-REPEATS = 2048
-SUBBATCH = 2048 // 16
+# Verbose controls
+VERBOSE            = os.getenv("PGDPO_VERBOSE", "1") == "1"   # 풍부 출력 on/off
+SAMPLE_PREVIEW_N   = int(os.getenv("PGDPO_SAMPLE_PREVIEW_N", 3))  # 미리보기 라인 수
+PRINT_COORD        = int(os.getenv("PGDPO_PRINT_COORD", 0))       # 다차원 u일 때 인덱스
 
+# ---------------------------------------------------------------------
+# Small utils
+# ---------------------------------------------------------------------
+def make_generator(seed: Optional[int] = None) -> torch.Generator:
+    g = torch.Generator(device=device if device.type != "cpu" else "cpu")
+    if seed is not None:
+        g.manual_seed(int(seed))
+    return g
 
-# -----------------------------------------------------------------------------
-# 공통 노이즈 생성 (X용 d, Y용 k 채널 분리)
-# -----------------------------------------------------------------------------
-def _draw_base_normals(B: int, steps: int, gen: torch.Generator):
-    Z = torch.randn(B, steps, d + k, device=device, generator=gen)
-    ZX, ZY = Z[:, :, :d], Z[:, :, d:]
-    return ZX, ZY
+def _divisors_desc(n: int):
+    return sorted([d for d in range(1, n + 1) if n % d == 0], reverse=True)
 
+def _as_numpy_1d(t: torch.Tensor, coord: int = 0):
+    x = t.detach().cpu().numpy()
+    if x.ndim == 2 and x.shape[1] > 1:
+        return x[:, coord]
+    return x.reshape(-1)
 
-# -----------------------------------------------------------------------------
-# 코스테이트 추정 (자동미분, random_draws 직접 생성)
-# -----------------------------------------------------------------------------
+def _save_overlaid_deltas_safe(u_learn, u_pp, u_cf, outdir: Optional[str], coord: int, fname: str):
+    if not outdir:
+        return
+    try:
+        from viz import save_overlaid_delta_hists
+        save_overlaid_delta_hists(
+            u_learn=u_learn, u_pp=u_pp, u_cf=u_cf,
+            outdir=outdir, coord=coord, fname=fname
+        )
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------
+# Generic DIRECT costate estimator (reward-based) with injected simulator
+#   simulate_fn(policy, B, train, initial_states_dict=..., random_draws=None,
+#               m_steps=None, rng=None, **kwargs) -> U (B,1) or (B,)
+# ---------------------------------------------------------------------
+SimulateFn = Callable[..., torch.Tensor]
+
 def estimate_costates(
+    simulate_fn: SimulateFn,
     policy_net: nn.Module,
     initial_states: Dict[str, torch.Tensor],
+    *,
     repeats: int,
     sub_batch: int,
     seed_eval: Optional[int] = None,
-):
+    needs: Iterable[str] = ("JX", "JXX", "JXY"),
+) -> Dict[str, Optional[torch.Tensor]]:
     """
-    자동미분으로 on-policy 코스테이트 추정.
-    시드는 random_draws를 직접 생성해서 넘김(호환 래퍼/seed_local 불필요).
-    Returns: {'JX': (B,·), 'JXX': (B,·), 'JXY': (B,·)?}
+    Estimate reward-based costates for given initial states (DIRECT simulator).
+      - JX  = ∂U/∂X
+      - JY  = ∂U/∂Y   (if Y present & requested)
+      - JXX = ∂²U/∂X²
+      - JXY = ∂²U/∂X∂Y
+      - JYY = ∂²U/∂Y²   (computed only if requested)
+    Only the derivatives requested in `needs` are computed.
     """
+    assert repeats > 0 and sub_batch > 0
+    needs = tuple(needs)
     B = next(iter(initial_states.values())).size(0)
 
-    # 미분 대상 leaf 상태 (X, Y만)
-    leaf_states = {
-        k: v.detach().clone().requires_grad_(True)
-        for k, v in initial_states.items()
-        if k in ["X", "Y"]
-    }
-    TmT_val = initial_states["TmT"].detach().clone()  # 시간 텐서는 미분 대상 아님
+    # Prepare leaf states
+    leaf: Dict[str, torch.Tensor] = {}
+    for k in ("X", "Y"):
+        if k in initial_states:
+            leaf[k] = initial_states[k].detach().clone().requires_grad_(True)
+    if not leaf:
+        raise RuntimeError("[core] estimate_costates: no differentiable states found (need X and/or Y).")
 
-    # 누적 버퍼
-    costate_sums = {
-        "JX": torch.zeros_like(leaf_states["X"]),
-        "JXX": torch.zeros_like(leaf_states["X"]),
-        "JXY": torch.zeros_like(leaf_states.get("Y")) if "Y" in leaf_states else None,
-    }
+    TmT_val = initial_states.get("TmT")
+    if TmT_val is not None:
+        TmT_val = TmT_val.detach().clone()  # not differentiated
 
-    # 정책 파라미터는 고정(코스테이트 추정 시 업데이트 없음)
+    # Freeze policy params
     params = list(policy_net.parameters())
     req_bak = [p.requires_grad for p in params]
     for p in params:
         p.requires_grad_(False)
 
+    # 누적 버퍼 (JYY 포함)
+    sums: Dict[str, Optional[torch.Tensor]] = {"JX": None, "JY": None, "JXX": None, "JXY": None, "JYY": None}
+
+    def _acc(name: str, val: Optional[torch.Tensor], weight: int):
+        if val is None:
+            return
+        if sums[name] is None:
+            sums[name] = val.detach() * weight
+        else:
+            sums[name] = sums[name] + val.detach() * weight
+
+    # simulate_fn 시그니처 검사 (rng 지원 여부)
+    sim_sig = inspect.signature(simulate_fn)
+    accepts_rng = "rng" in sim_sig.parameters
+
+    done = 0
     try:
-        done = 0
         while done < repeats:
             rpts = min(sub_batch, repeats - done)
 
-            # 동일 상태 rpts번 복제 → 총 B*rpts
-            batch_states = {k: v.repeat(rpts, 1) for k, v in leaf_states.items()}
-            batch_states["TmT"] = TmT_val.repeat(rpts, 1)
+            # replicate states rpts times → total B*rpts
+            batch_states: Dict[str, torch.Tensor] = {k: v.repeat(rpts, 1) for k, v in leaf.items()}
+            if TmT_val is not None:
+                batch_states["TmT"] = TmT_val.repeat(rpts, 1)
 
-            # 타일/서브배치 재현성: seed_eval + done
-            gen = make_generator((seed_eval or 0) + done)
-            ZX, ZY = _draw_base_normals(B * rpts, m, gen)
+            rng_arg = make_generator((seed_eval or 0) + done) if accepts_rng else None
 
-            # simulate는 U=-J를 반환한다고 가정
-            U = simulate(
-                policy_net,
-                B * rpts,
-                train=True,
-                initial_states_dict=batch_states,
-                random_draws=(ZX, ZY),  # ← 시드 대신 명시 노이즈 전달
-                m_steps=m,
-            )
+            with torch.enable_grad():
+                # simulate
+                args = [policy_net, B * rpts]
+                kwargs = {"train": True, "initial_states_dict": batch_states, "m_steps": None}
+                if accepts_rng:
+                    kwargs["rng"] = rng_arg
+                U = simulate_fn(*args, **kwargs)  # (B*rpts, 1) or (B*rpts,)
+                if not U.requires_grad:
+                    raise RuntimeError(
+                        "simulate() returned a tensor without grad.\n"
+                        "Check tests/<model>/user_pgdpo_base.py::simulate:\n"
+                        "  - MUST consume the provided initial_states_dict['X'] (and 'Y') directly (no resampling)\n"
+                        "  - MUST NOT detach() X/Y or wrap the sim in @torch.no_grad()\n"
+                        "  - MUST return a torch tensor that depends on X/Y (e.g., terminal utility)"
+                    )
+                U = U.view(B * rpts, -1).mean(dim=1).view(rpts, B).mean(dim=0)  # (B,)
 
-            # (rpts, B, ·) 평균 → (B, ·), 다시 전체 평균 스칼라
-            U_bar = U.view(rpts, B, -1).mean(dim=0)
-            J_scalar = U_bar.mean()
+                # 1st derivatives
+                need_2nd = any(k in needs for k in ("JXX", "JXY", "JYY"))
+                targets = []
+                if "X" in leaf: targets.append(leaf["X"])
+                if "Y" in leaf: targets.append(leaf["Y"])
+                grads = torch.autograd.grad(
+                    U.sum(),
+                    tuple(targets),
+                    create_graph=need_2nd,
+                    retain_graph=need_2nd,
+                    allow_unused=True
+                )
+                grad_map: Dict[str, Optional[torch.Tensor]] = {"JX": None, "JY": None}
+                idx = 0
+                if "X" in leaf:
+                    grad_map["JX"] = grads[idx]; idx += 1
+                if "Y" in leaf:
+                    grad_map["JY"] = grads[idx] if len(grads) > idx else None
 
-            # 1차: JX = ∂U/∂X
-            JX_b = torch.autograd.grad(
-                J_scalar, leaf_states["X"], retain_graph=True, create_graph=True
-            )[0]
+                # 2nd derivatives (if requested)
+                JXX_batch = None
+                JXY_batch = None
+                JYY_batch = None
 
-            # 2차: JXX, JXY(필요 시)
-            grad_targets = [leaf_states["X"]]
-            if "Y" in leaf_states:
-                grad_targets.append(leaf_states["Y"])
+                if need_2nd:
+                    if ("JXX" in needs) and ("X" in leaf) and (grad_map["JX"] is not None):
+                        JXX_batch, = torch.autograd.grad(
+                            grad_map["JX"].sum(), leaf["X"],
+                            retain_graph = (("JXY" in needs) or ("JYY" in needs)) and ("Y" in leaf)
+                        )
+                    if ("JXY" in needs) and ("Y" in leaf) and (grad_map["JX"] is not None):
+                        JXY_batch, = torch.autograd.grad(
+                            grad_map["JX"].sum(), leaf["Y"],
+                            retain_graph = ("JYY" in needs) and ("Y" in leaf) and (grad_map["JY"] is not None)
+                        )
+                    if ("JYY" in needs) and ("Y" in leaf) and (grad_map["JY"] is not None):
+                        JYY_batch, = torch.autograd.grad(grad_map["JY"].sum(), leaf["Y"])
 
-            JXX_b, *JXY_b_tuple = torch.autograd.grad(
-                JX_b.sum(),
-                grad_targets,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=True,
-            )
-            JXY_b = JXY_b_tuple[0] if JXY_b_tuple else None
-
-            # 누적(서브배치 가중치 rpts)
-            costate_sums["JX"] += JX_b.detach() * rpts
-            costate_sums["JXX"] += (
-                JXX_b.detach() if JXX_b is not None else torch.zeros_like(leaf_states["X"])
-            ) * rpts
-            if costate_sums["JXY"] is not None and JXY_b is not None:
-                costate_sums["JXY"] += JXY_b.detach() * rpts
+                # accumulate
+                if "JX" in needs and grad_map["JX"] is not None:
+                    _acc("JX", grad_map["JX"], rpts)
+                if "JY" in needs and grad_map["JY"] is not None:
+                    _acc("JY", grad_map["JY"], rpts)
+                if "JXX" in needs and JXX_batch is not None:
+                    _acc("JXX", JXX_batch, rpts)
+                if "JXY" in needs and JXY_batch is not None:
+                    _acc("JXY", JXY_batch, rpts)
+                if "JYY" in needs and JYY_batch is not None:
+                    _acc("JYY", JYY_batch, rpts)
 
             done += rpts
+
+        invN = 1.0 / repeats
+        return {k: (v * invN if v is not None else None) for k, v in sums.items()}
     finally:
         for p, r in zip(params, req_bak):
             p.requires_grad_(r)
 
-    inv = 1.0 / float(repeats)
-    return {k: v * inv for k, v in costate_sums.items() if v is not None}
-
-
-# -----------------------------------------------------------------------------
-# Direct P-PGDPO: 코스테이트 추정 → PMP 사영
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Direct projector helper: compute u_pp via user projector on given states
+# ---------------------------------------------------------------------
 def ppgdpo_u_direct(
-    policy_s1: nn.Module,
+    pol_s1: nn.Module,
     states: Dict[str, torch.Tensor],
-    repeats: int,
-    sub_batch: int,
+    *,
+    repeats: int = REPEATS,
+    sub_batch: int = SUBBATCH,
     seed_eval: Optional[int] = None,
+    needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> torch.Tensor:
-    with torch.enable_grad():
-        costates = estimate_costates(policy_s1, states, repeats, sub_batch, seed_eval=seed_eval)
-        u = project_pmp(costates, states)         # 기존 사영
-        return u.detach()
+    """
+    Compute projected control u_pp on given states using DIRECT simulate (user_pgdpo_base.simulate).
+    """
+    from user_pgdpo_base import simulate as simulate_base
+    costates = estimate_costates(
+        simulate_base, pol_s1, states,
+        repeats=repeats, sub_batch=sub_batch, seed_eval=seed_eval, needs=needs
+    )
+    u = project_pmp(costates, states)
+    return u
 
-def _divisors_desc(n: int):
-    return sorted([d for d in range(1, n + 1) if n % d == 0], reverse=True)
-
-
-# -----------------------------------------------------------------------------
-# 평가/시각화: 학습정책 vs P-PGDPO 사영, (있으면) 폐형해 비교
-# -----------------------------------------------------------------------------
-@torch.no_grad()
+# ---------------------------------------------------------------------
+# Public evaluator (DIRECT) used by run.py or standalone main
+# ---------------------------------------------------------------------
 def print_policy_rmse_and_samples_direct(
     pol_s1: nn.Module,
-    pol_cf: nn.Module | None,
+    pol_cf: Optional[nn.Module],
     *,
-    repeats: int,
-    sub_batch: int,
-    seed_eval: int | None = None,
-    tile: int | None = None,
-    outdir: str | None = None,
+    repeats: int = REPEATS,
+    sub_batch: int = SUBBATCH,
+    seed_eval: Optional[int] = None,
+    outdir: Optional[str] = None,
+    tile: Optional[int] = None,
+    enable_pp: bool = True,
+    prefix: str = "direct",
+    needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> None:
     """
-    Projection/direct 모드 평가기.
-    - u_learn = pol_s1(**states)
-    - u_pp_dir = ppgdpo_u_direct(...) (타일링으로 OOM 방지)
-    - (있으면) u_cf = pol_cf(**states)
-    - RMSE 출력 + pairwise 히스토그램/산점도 저장
+    DIRECT evaluator (simple/base simulator):
+      - simulate_fn = user_pgdpo_base.simulate
+      - compares: learned vs (optional) closed-form vs (optional) projected
     """
-    # RNG & states
+    # prepare eval points
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
 
-    # 학습 정책 출력
+    # learned policy output
     u_learn = pol_s1(**states_dict)
 
-    # 타일 사이즈 결정(+OOM 대비)
-    B = next(iter(states_dict.values())).size(0)
-    divisors = _divisors_desc(B)
-    start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
-
-    # P-PGDPO(direct) 액션 계산 (타일 순회)
-    u_pp_dir = torch.empty_like(u_learn)
-    for idx in range(start_idx, len(divisors)):
-        cur_tile = divisors[idx]
-        try:
-            for s in range(0, B, cur_tile):
-                e = min(B, s + cur_tile)
-                tile_states = {k: v[s:e] for k, v in states_dict.items()}
-                u_pp_dir[s:e] = ppgdpo_u_direct(
-                    pol_s1, tile_states, repeats, sub_batch, seed_eval=seed_eval
-                )
-            break  # 성공했으면 종료
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if idx + 1 < len(divisors):
-                    print(f"[Eval] OOM; reducing tile -> {divisors[idx+1]}")
+    # projected policy (optional)
+    u_pp = None
+    if enable_pp:
+        B = next(iter(states_dict.values())).size(0)
+        divisors = _divisors_desc(B)
+        start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
+        u_pp = torch.empty_like(u_learn)
+        for idx in range(start_idx, len(divisors)):
+            cur_tile = divisors[idx]
+            try:
+                for s in range(0, B, cur_tile):
+                    e = min(B, s + cur_tile)
+                    tile_states = {k: v[s:e] for k, v in states_dict.items()}
+                    u_pp[s:e] = ppgdpo_u_direct(
+                        pol_s1, tile_states,
+                        repeats=repeats, sub_batch=sub_batch, seed_eval=seed_eval, needs=tuple(needs)
+                    )
+                break
+            except RuntimeError as oom:
+                if "out of memory" in str(oom).lower():
                     continue
-                else:
-                    print("[Eval] OOM; could not reduce tile further.")
-                    raise
-            else:
                 raise
 
-    # 폐형해가 있으면 로드
+    # closed-form (optional)
     u_cf = pol_cf(**states_dict) if pol_cf is not None else None
 
-    # RMSE 출력 및 메트릭 저장
+    # RMSE (learn vs CF)
     if u_cf is not None:
-        rmse_learn = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-        rmse_pp_dir = torch.sqrt(((u_pp_dir - u_cf) ** 2).mean()).item()
-        print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
-        print(f"[Policy RMSE-PP(direct)] ||u_pp(direct) - u_closed-form||_RMSE: {rmse_pp_dir:.6f}")
-        if outdir is not None:
-            append_metrics_csv(
-                {"rmse_learn_cf_direct": rmse_learn, "rmse_pp_cf_direct": rmse_pp_dir}, outdir
-            )
-    else:
-        print("[INFO] No closed-form policy provided for comparison.")
+        rmse = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
+        print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse:.6f}")
 
-    # 히스토그램/산점도 저장
-    if outdir is not None:
-        save_overlaid_delta_hists(
-            u_learn=u_learn, u_pp=u_pp_dir, u_cf=u_cf,
-            outdir=outdir, coord=0, fname="delta_projection_overlaid_hist.png",
-            bins=60, density=True
-        )
-        save_pairwise_scatters(
-            u_learn=u_learn, u_pp=u_pp_dir, u_cf=u_cf,
-            outdir=outdir, coord=0, prefix="scatter_projection"
-        )
+    # RMSE (PP-direct vs CF) — 풍부 출력 복원
+    if enable_pp and (u_pp is not None) and (u_cf is not None):
+        rmse_pp = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
+        print(f"[Policy RMSE-PP(direct)] ||u_pp(direct) - u_closed-form||_RMSE: {rmse_pp:.6f}")
 
-    # 대표 샘플 3개 출력
-    idxs = [0, B // 2, B - 1]
-    for i in idxs:
-        state_parts, vector_found = [], False
-        for key, value in states_dict.items():
-            ts = value[i]
-            if ts.numel() > 1:
-                state_parts.append(f"{key}[0]={ts[0].item():.3f}")
-                vector_found = True
-            else:
-                state_parts.append(f"{key}={ts.item():.3f}")
-        if vector_found:
-            state_parts.append("...")
-        state_str = ", ".join(state_parts)
+    # sample preview (first N)
+    if VERBOSE and enable_pp:
+        n = min(SAMPLE_PREVIEW_N, u_learn.size(0))
+        X_vals   = _as_numpy_1d(states_dict.get("X"), 0)[:n] if "X" in states_dict else [None]*n
+        TmT_vals = _as_numpy_1d(states_dict.get("TmT"), 0)[:n] if "TmT" in states_dict else [None]*n
+        uL = _as_numpy_1d(u_learn, PRINT_COORD)[:n]
+        uP = _as_numpy_1d(u_pp,    PRINT_COORD)[:n] if u_pp is not None else [None]*n
+        uC = _as_numpy_1d(u_cf,    PRINT_COORD)[:n] if u_cf is not None else [None]*n
+        for i in range(n):
+            if u_pp is not None and u_cf is not None:
+                print(f"  (X={X_vals[i]:.3f}, TmT={TmT_vals[i]:.3f}) -> "
+                      f"(u_learn[{i}]={uL[i]:.4f}, u_pp(dir)[{i}]={uP[i]:.4f}, u_cf[{i}]={uC[i]:.4f})")
+            elif u_pp is not None:
+                print(f"  (X={X_vals[i]:.3f}, TmT={TmT_vals[i]:.3f}) -> "
+                      f"(u_learn[{i}]={uL[i]:.4f}, u_pp(dir)[{i}]={uP[i]:.4f})")
+            elif u_cf is not None:
+                print(f"  (X={X_vals[i]:.3f}, TmT={TmT_vals[i]:.3f}) -> "
+                      f"(u_learn[{i}]={uL[i]:.4f}, u_cf[{i}]={uC[i]:.4f})")
 
-        if u_cf is not None:
-            print(
-                f"  ({state_str}) -> (u_learn[0]={u_learn[i,0].item():.4f}, "
-                f"u_pp_dir[0]={u_pp_dir[i,0].item():.4f}, "
-                f"u_cf[0]={u_cf[i,0].item():.4f}, ...)"
-            )
-        else:
-            print(
-                f"  ({state_str}) -> (u_learn[0]={u_learn[i,0].item():.4f}, "
-                f"u_pp_dir[0]={u_pp_dir[i,0].item():.4f}, ...)"
-            )
-
-
+    # overlay deltas (optional viz)
+    _save_overlaid_deltas_safe(u_learn, u_pp, u_cf, outdir, coord=PRINT_COORD, fname=f"{prefix}_delta_overlaid_hist.png")
 
 # -----------------------------------------------------------------------------
 # 독립 실행 테스트
 # -----------------------------------------------------------------------------
 def main():
     # base 학습 → direct 평가 (간이 테스트)
+    from pgdpo_base import run_common, train_stage1_base  # lazy import to avoid cycles
     run_common(
         train_fn=train_stage1_base,
         rmse_fn=print_policy_rmse_and_samples_direct,
@@ -288,10 +357,8 @@ def main():
         rmse_kwargs={"repeats": REPEATS, "sub_batch": SUBBATCH, "seed_eval": CRN_SEED_EU},
     )
 
-
 if __name__ == "__main__":
     main()
-
 
 __all__ = [
     "REPEATS",
@@ -300,4 +367,5 @@ __all__ = [
     "project_pmp",
     "ppgdpo_u_direct",
     "print_policy_rmse_and_samples_direct",
+    "VERBOSE", "SAMPLE_PREVIEW_N"
 ]

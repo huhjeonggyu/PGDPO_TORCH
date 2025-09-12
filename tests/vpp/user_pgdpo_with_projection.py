@@ -1,7 +1,7 @@
 # tests/vpp/user_pgdpo_with_projection.py
 import torch
 # ✨ user_pgdpo_base에서 R_diag와 가격 함수를 가져옴
-from user_pgdpo_base import R_diag, price_fn, T, u_min, u_max
+from user_pgdpo_base import R_diag, price_fn, T
 
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     """
@@ -17,6 +17,7 @@ def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     # 각 차원별로 연산
     # (B,1) + (B,d) -> (B,d) (브로드캐스팅)
     # (B,d) / (d,)    -> (B,d) (브로드캐스팅)
-    u = (price + JX) / R_diag.view(1, -1)
+    #u = (price + JX) / R_diag.view(1, -1)
+    u = (price - JX) / R_diag.view(1, -1)
     
-    return torch.clamp(u, u_min, u_max)
+    return u

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 # ✨ user_pgdpo_base에서 필요한 변수들을 가져옴
-from user_pgdpo_base import d, price_fn, T, device, R_diag, u_min, u_max
+from user_pgdpo_base import d, price_fn, T, device, R_diag
 
 class MyopicPolicy(nn.Module):
     """
@@ -18,4 +18,4 @@ class MyopicPolicy(nn.Module):
         price = price_fn(t)         # (B,1)
         # (B,1) * (1,d) -> (B,d) (브로드캐스팅)
         u = price * self.inv_R_diag
-        return torch.clamp(u, u_min, u_max)
+        return u

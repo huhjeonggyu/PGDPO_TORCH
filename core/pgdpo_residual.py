@@ -30,9 +30,6 @@ try :
 except Exception as e:
     raise RuntimeError(f"[pgdpo_residual] Failed to import symbols from user_pgdpo_residual: {e}")    
 
-# 잔차 제어 클램프 한계(필요 시 조정)
-U_CAP_RESIDUAL = 5.0
-
 
 # ========================= 잔차 래퍼 =========================
 class ResidualPolicy(nn.Module):
@@ -42,10 +39,9 @@ class ResidualPolicy(nn.Module):
     - 입력: X, (optional) Y, TmT
     - 출력: (B, d)
     """
-    def __init__(self, base_policy: nn.Module, residual_cap: float = U_CAP_RESIDUAL):
+    def __init__(self, base_policy: nn.Module):
         super().__init__()
         self.base = base_policy
-        self.cap  = float(residual_cap)
 
         # ✅ 기존 변수명을 활용하여 상태 차원을 동적으로 계산하도록 수정
         state_dim = DIM_X + DIM_Y + 1    # X(DIM_X) + Y(DIM_Y) + TmT(1)
@@ -75,17 +71,10 @@ class ResidualPolicy(nn.Module):
         # ✅ 주석도 실제 차원을 반영하도록 수정
         x_in = torch.cat(feats, dim=1)  # (B, DIM_X + DIM_Y + 1)
 
-        delta_u = torch.tanh(self.net(x_in)) * self.cap
+        delta_u = self.net(x_in)
         u = base_u + delta_u
-
-        # ✅ 최종 제어 클램프도 모델별 u_cap을 존중하도록 개선
-        try:
-            from user_pgdpo_base import u_cap as model_u_cap
-            final_cap = float(model_u_cap)
-        except (ImportError, AttributeError):
-            final_cap = self.cap
             
-        return torch.clamp(u, -final_cap, +final_cap)
+        return u
         
 
 # ========================= 학습 루프 =========================
@@ -111,7 +100,7 @@ def train_residual_stage1(
         ) from e
 
     base_policy = MyopicPolicy().to(device)
-    policy = ResidualPolicy(base_policy, residual_cap=U_CAP_RESIDUAL).to(device)
+    policy = ResidualPolicy(base_policy).to(device)
 
     # 잔차 네트워크만 학습
     opt = optim.Adam(policy.net.parameters(), lr=lr)

@@ -10,6 +10,7 @@ from typing import Callable, Dict, Any, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import os
 
 # -----------------------------------------------------------------------------
 # 사용자 모델 심볼 로드 (tests/<model>/user_pgdpo_base.py가 제공)
@@ -30,7 +31,7 @@ try:
 except Exception as e:
     raise RuntimeError(f"[pgdpo_base] Failed to import symbols from user_pgdpo_base: {e}")
 
-PGDPO_TRAJ_B: int = 5
+PGDPO_TRAJ_B  = int(os.getenv("PGDPO_TRAJ_B", 5))
 
 # -----------------------------------------------------------------------------
 # RNG 유틸

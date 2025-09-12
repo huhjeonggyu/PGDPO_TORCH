@@ -1,164 +1,196 @@
 # tests/vpp/user_pgdpo_base.py
+# VPP LQ Tracking (Paper Sec. 5.1) — user definitions for PG-DPO framework
+# - State (per battery): x_i (SoC)
+# - Control: u_i (charge + / discharge -)
+# - SDE: dx_i = -u_i dt + sigma_i dW_i
+# - Reward: P(t) * sum(u) - 0.5 u^T R u - 0.5 (x - x_tar)^T Q (x - x_tar)
+
 import os
+import math
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-
-# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
-d = 10
-k = 0
-epochs = 500
-batch_size = 1024
-lr = 1e-4
-seed = 42
-
-d = int(os.getenv("PGDPO_D", d))
-epochs = int(os.getenv("PGDPO_EPOCHS", epochs))
-batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_size))
-lr = float(os.getenv("PGDPO_LR", lr))
-seed = int(os.getenv("PGDPO_SEED", seed))
-# --- 블록 끝 ---
 
 # ================== (A) Dimensions & global config ==================
+# defaults (overridable via env)
+d_default      = 10
+epochs_default = 500
+batch_default  = 1024
+lr_default     = 1e-4
+seed_default   = 42
+
+# --- 모델별 설정 및 환경변수 오버라이드 블록 ---
+d        = int(os.getenv("PGDPO_D", d_default))
+k        = 0
+epochs   = int(os.getenv("PGDPO_EPOCHS", epochs_default))
+batch_size = int(os.getenv("PGDPO_BATCH_SIZE", batch_default))
+lr       = float(os.getenv("PGDPO_LR", lr_default))
+seed     = int(os.getenv("PGDPO_SEED", seed_default))
+# --- 블록 끝 ---
+
 DIM_X, DIM_Y, DIM_U = d, k, d
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CRN_SEED_EU = 777
-N_eval_states = 2048
+
+# 공통 시드
+CRN_SEED_EU   = 777            # eval common random numbers (코어와 호환)
+N_eval_states = 2048           # 코어 평가 루틴이 기대하는 샘플 수
 
 torch.manual_seed(seed); np.random.seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-# ================== (B) Problem parameters (수정됨) ==================
-T = 1.0
-m = 40
+# ================== (B) Problem parameters ==================
+T       = 1.0
+m       = 40
 dt_const = T / m
 
-# ✨ 1. (신규) 상태 추종 페널티 가중치
-# 각 배터리의 SoC가 목표치(x_target)에서 벗어날 때 부과되는 페널티의 강도
-state_penalty_weight = 5.0 
-x_target = 0.5
+# (1) Price model P(t)
+def price_fn(t_tensor: torch.Tensor) -> torch.Tensor:
+    # t in [0, T]
+    # multi-harmonic day-ahead–like profile; clamp to strictly positive
+    price = 25 * torch.sin(2 * torch.pi * t_tensor / T) \
+          + 15 * torch.sin(4 * torch.pi * t_tensor / T) + 30
+    return price.clamp_min(0.1)  # avoid degenerate division
 
-# 이종(Heterogeneous) 비용 파라미터 R_i
+# (2) Heterogeneous quadratic control costs R = diag(R_i)  (SPD)
 R_diag = torch.empty(d, device=device).uniform_(0.2, 1.0)
 R_matrix = torch.diag(R_diag)
 
-# 변동성 있는 전력 가격 모델 P(t)
-def price_fn(t_tensor: torch.Tensor) -> torch.Tensor:
-    price = 25 * torch.sin(2 * torch.pi * t_tensor / T) + \
-            15 * torch.sin(4 * torch.pi * t_tensor / T) + 30
-    return price.clamp_min(0.1)
+# (3) Heterogeneous state-tracking penalties Q = diag(Q_i)  (SPD)
+Q_diag = torch.empty(d, device=device).uniform_(0.5, 1.5)
+Q_matrix = torch.diag(Q_diag)
 
-# 이종(Heterogeneous) 노이즈 파라미터
+# (4) SoC target (vector form; can be heterogeneous if desired)
+x_target_scalar = 0.5
+x_target_vec = torch.full((1, d), x_target_scalar, device=device)
+
+# (5) Noise scales (control-independent diffusion)
 vols_W = torch.empty(d, device=device).uniform_(0.3, 0.7)
 
-u_min, u_max = -1000.0, 1000.0
+# ================== (C) Helpers ==================
+def _draw_dW_from_ZX(ZX_slice: torch.Tensor, dt_val: float) -> torch.Tensor:
+    # ZX_slice: (B, d) ~ N(0,1)
+    return ZX_slice * vols_W * math.sqrt(dt_val)
 
-def draw_dW(B: int, dt_val: float):
-    scale = torch.sqrt(torch.tensor(dt_val, device=device))
-    return torch.randn(B, d, device=device) * vols_W * scale
+def draw_dW(B: int, dt_val: float, *, rng: torch.Generator | None = None) -> torch.Tensor:
+    # fallback Gaussian
+    Z = torch.randn(B, d, device=device, generator=rng)
+    return _draw_dW_from_ZX(Z, dt_val)
 
+# ================== (D) Policy (direct actor) ==================
 class DirectPolicy(nn.Module):
+    """Feed-forward policy u = pi(X, T - t)."""
     def __init__(self):
         super().__init__()
-        state_dim = DIM_X + DIM_Y + 1
+        state_dim = DIM_X + 1  # [X, TmT]
         hidden = 128
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden),    nn.ReLU(),
             nn.Linear(hidden, DIM_U)
         )
+        # start near-zero to ease warm-up stability
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, **states_dict) -> torch.Tensor:
-        X   = states_dict["X"]
-        TmT = states_dict["TmT"]
+        X   = states_dict["X"]   # (B,d)
+        TmT = states_dict["TmT"] # (B,1) = T - t
         x_in = torch.cat([X, TmT], dim=1)
         u = self.net(x_in)
-        return torch.clamp(u, u_min, u_max)
+        return u
 
-# ================== (E) Simulator (수정됨) ==================
+# ================== (E) Simulator ==================
 def sample_initial_states(B: int, *, rng: torch.Generator | None = None):
-    X0 = torch.rand((B, DIM_X), device=device, generator=rng) * 0.6 + 0.2
+    # Start SoC in [0.2, 0.8]; initial remaining time TmT ~ U[0,T]
+    X0   = torch.rand((B, DIM_X), device=device, generator=rng) * 0.6 + 0.2
     TmT0 = torch.rand((B, 1), device=device, generator=rng) * T
     dt_vec = torch.full_like(TmT0, dt_const)
     return {'X': X0, 'TmT': TmT0}, dt_vec
 
-def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, random_draws=None, m_steps=None):
+@torch.enable_grad()
+def simulate(
+    policy: nn.Module,
+    B: int,
+    *,
+    train: bool = True,
+    rng: torch.Generator | None = None,
+    initial_states_dict: dict | None = None,
+    random_draws: tuple[torch.Tensor, torch.Tensor] | None = None,  # (ZX, ZY); VPP uses ZX only
+    m_steps: int | None = None
+):
     """
-    ✨ 목표 함수에 '상태 추종 페널티' 추가
-    - Reward per step: (Price * sum(u)) - 0.5 * u'Ru - 0.5 * weight * ||x - x_target||^2
+    Returns reward to be maximized:
+        profit = ∫ [ P(t) * sum(u)
+                     - 0.5 * u^T R u
+                     - 0.5 * (x - x_tar)^T Q (x - x_tar) ] dt
+    Compatible with core: if random_draws passed, uses ZX[:, step, :] as dW source.
     """
     m_eff = m_steps if m_steps is not None else m
+
     if initial_states_dict is None:
         states, dt = sample_initial_states(B, rng=rng)
     else:
         states, dt = initial_states_dict, torch.full_like(initial_states_dict['TmT'], T / float(m_eff))
 
-    X = states['X']
+    X = states['X']           # (B,d)
+    TmT0 = states['TmT']      # (B,1) = T - t0
     total_profit = torch.zeros(B, 1, device=device)
 
-    for i in range(m_eff):
-        t_current = T - (states['TmT'] - i * dt)
-        current_states = {'X': X, 'TmT': states['TmT'] - i * dt}
-        u = policy(**current_states)
+    # unpack ZX if provided
+    ZX = None
+    if random_draws is not None and isinstance(random_draws, tuple) and len(random_draws) >= 1:
+        ZX = random_draws[0]  # (B, m_eff, d)
 
-        # 수익 계산 로직
-        price = price_fn(t_current)
-        revenue = price * torch.sum(u, dim=1, keepdim=True)
-        op_cost = 0.5 * torch.einsum('bi,ij,bj->b', u, R_matrix, u).unsqueeze(1)
-        
-        # ✨ 2. (신규) 상태 페널티 계산
-        # 현재 상태 X가 목표치 x_target에서 벗어난 정도에 따라 페널티 부과
-        state_penalty = 0.5 * state_penalty_weight * torch.sum((X - x_target)**2, dim=1, keepdim=True)
+    for k_step in range(m_eff):
+        # current time and remaining time
+        t_k  = T - (TmT0 - k_step * dt)   # (B,1)
+        TmTk = TmT0 - k_step * dt         # (B,1)
 
-        # ✨ 3. (수정) 최종 단계별 보상 계산
-        profit_step = revenue - op_cost - state_penalty
+        # policy eval
+        cur_states = {'X': X, 'TmT': TmTk}
+        u = policy(**cur_states) if train else policy(**cur_states).detach()
+
+        # reward components
+        price  = price_fn(t_k)                               # (B,1)
+        rev    = price * torch.sum(u, dim=1, keepdim=True)   # P(t)*1^T u
+        quad_u = 0.5 * torch.einsum('bi,ij,bj->b', u, R_matrix, u).unsqueeze(1)
+        x_err  = X - x_target_vec
+        quad_x = 0.5 * torch.einsum('bi,ij,bj->b', x_err, Q_matrix, x_err).unsqueeze(1)
+
+        profit_step = rev - quad_u - quad_x
         total_profit += profit_step * dt
 
-        # SDE step
-        dW = draw_dW(B, float(dt_const))
+        # SDE step: dx = -u dt + sigma dW
+        if ZX is not None:
+            dW = _draw_dW_from_ZX(ZX[:, k_step, :], float(dt_const))
+        else:
+            dW = draw_dW(B, float(dt_const), rng=rng)
         X = X - u * dt + dW
-        # X = torch.clamp(X, 0.0, 1.0) # 필요시 SoC 제약 추가
+        # (optional) clamp SoC
+        # X = X.clamp_(0.0, 1.0)
 
-    # 프레임워크가 보상(reward)을 최대화하도록 수익(profit)을 직접 반환
     return total_profit
 
-# ================== (F) Closed-form (수정됨) ==================
-class AnalyticalMyopicPolicy(nn.Module):
-    """
-    ✨ 수정된 해석적 해: u_i(t) = P(t) / R_i (Co-state 무시)
-    """
-    def __init__(self):
-        super().__init__()
-        # R_diag는 (d,) 형태이므로 (1,d)로 브로드캐스팅 가능하게 만듦
-        self.register_buffer("inv_R_diag", 1.0 / R_diag.view(1, -1))
-
-    def forward(self, **states_dict):
-        t = T - states_dict['TmT']
-        price = price_fn(t)
-        # 각 배터리는 자신의 비용(R_i)에만 반응
-        u = price * self.inv_R_diag
-        return torch.clamp(u, u_min, u_max)
-
+# ================== (F) Closed-form reference (S, ψ) ==================
+# 논문 5.1의 PMP/LQ 폐형해 참조정책 — RMSE 비교를 위해 사용
 def build_closed_form_policy():
-    print("✅ Analytical VPP myopic policy for HETEROGENEOUS units loaded.")
-    return AnalyticalMyopicPolicy().to(device), None
+    from tests.vpp.closed_form_ref import build_closed_form_policy as _build_cf
+    print("✅ Closed-form PMP policy (S, ψ 기반) loaded.")
+    # 코어의 print_policy_rmse_and_samples_* 시그니처와 호환 (두 번째 리턴은 None)
+    return _build_cf(), None
 
+# ================== (G) Viz / misc ==================
 def ref_signals_fn(t_np: np.ndarray) -> dict:
-    """
-    비교를 위해 그래프에 함께 표시할 외부 신호(가격)를 반환합니다.
-    """
-    # price_fn은 tensor를 입력받으므로 numpy 배열을 tensor로 변환했다가 다시 변환합니다.
+    # for overlaying price curve on plots
     price_t = price_fn(torch.from_numpy(t_np).float().to(device))
     return {"Price": price_t.cpu().numpy()}
 
-R_INFO = {"R": R_matrix}
+R_INFO = {"R": R_matrix, "R_diag": R_diag, "Q": Q_matrix, "Q_diag": Q_diag}
 
 def get_traj_schema():
     """
-    어떤 변수를 어떻게 시각화할지 정의하는 스키마를 반환합니다.
+    Visualization schema consumed by core viz helpers.
     """
     return {
         "roles": {
@@ -166,7 +198,6 @@ def get_traj_schema():
             "U": {"dim": int(DIM_U), "labels": [f"u_{i+1}"   for i in range(int(DIM_U))]},
         },
         "views": [
-            # ✨ 새로운 그래프 뷰 정의
             {"name": "Arbitrage_Strategy", "mode": "tracking_vpp", "ylabel": "Price / Power"},
             {"name": "U_Rnorm", "mode": "u_rnorm", "block": "U", "ylabel": "||u||_R"},
         ],
