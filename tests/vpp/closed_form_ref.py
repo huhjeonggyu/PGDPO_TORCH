@@ -1,46 +1,80 @@
 # tests/vpp/closed_form_ref.py
 import torch
-from math import sqrt, tanh
 from user_pgdpo_base import T, device, R_diag, Q_diag, x_target_vec, price_fn
 
-@torch.no_grad()
-def S_i_t(Qi, Ri, tau):
-    # S_i(t) = sqrt(Q_i R_i) * tanh( sqrt(Q_i/R_i)*(T-t) )  (tau = T - t)
-    return sqrt(Qi*Ri) * tanh(sqrt(Qi/Ri)*tau)
-
-@torch.no_grad()
-def psi_i_t(Qi, Ri, tau, price_grid, time_grid):
-    # -dot(psi) = -Qi x_tar + (S/Ri)(psi - P), psi(T)=0
-    # 수치 적분(뒤에서 앞으로) - 간단한 Euler로 충분
-    dt = time_grid[1]-time_grid[0]
-    psi = 0.0
-    tpsi = 0.0
-    for j in range(len(time_grid)-1, -1, -1):
-        s_over_R = S_i_t(Qi, Ri, T - time_grid[j]) / Ri
-        rhs = -Qi*x_target_vec[0,0] + s_over_R*(psi - float(price_grid[j]))
-        psi = psi - rhs * dt
-    return psi
-
 class ClosedFormPolicy(torch.nn.Module):
-    def __init__(self, n_grid=2001):
+    """
+    논문 5.1 VPP LQ tracking의 폐형해:
+      u*(t,x) = -(S(t)/R) (x - x_tar) - psi(t)/R + P(t)/R
+    여기서
+      S(t) = sqrt(Q R) * tanh( sqrt(Q/R) * (T - t) ),
+      psi(T) = 0,   -psi_dot = -Q x_tar + (S/R)(psi - P).
+    구현:
+      - 시간격자(grid) 위에서 S/R 및 psi를 전계산(Backward Euler)
+      - forward에서는 (t)에 대해 선형보간해 psi(t)를 읽어 사용
+    """
+    def __init__(self, n_grid: int = 2001):
         super().__init__()
+        # (1,d) 모양의 대각 벡터들을 버퍼로 보관
         self.register_buffer("R_diag", R_diag.view(1, -1))
         self.register_buffer("Q_diag", Q_diag.view(1, -1))
-        self.n_grid = n_grid
-        # 미리 시간/가격 그리드 만들고 채널별 S, ψ 테이블도 만들어 캐싱해도 됨 (간단화를 위해 런타임 계산 가능)
+        self.register_buffer("x_tar",  x_target_vec.clone())   # (1,d)
+        self.n_grid = int(n_grid)
 
+        # 시간격자 및 외생가격 P(t) 테이블
+        grid = torch.linspace(0.0, T, steps=self.n_grid, device=device)        # (G,)
+        self.register_buffer("grid", grid)
+        price_grid = price_fn(grid.view(-1, 1)).view(-1)                       # (G,)
+        self.register_buffer("price_grid", price_grid)
+
+        # S_over_R(t) = S(t)/R = sqrt(Q/R) * tanh( sqrt(Q/R) * (T - t) )
+        sqrt_Q_over_R = torch.sqrt(self.Q_diag / self.R_diag)                  # (1,d)
+        tau_grid = (T - grid).view(-1, 1)                                      # (G,1) = 잔여시간
+        S_over_R_grid = sqrt_Q_over_R * torch.tanh(sqrt_Q_over_R * tau_grid)   # (G,d)
+        self.register_buffer("S_over_R_grid", S_over_R_grid)
+
+        # psi_tab[j] ≈ psi(grid[j]) (G,d) — Backward Euler로 적분
+        G = self.n_grid
+        psi_tab = torch.zeros(G, self.R_diag.size(1), device=device)           # (G,d), psi(T)=0
+        dt_grid = grid[1:] - grid[:-1]                                         # (G-1,)
+
+        # j = G-2 ... 0 (뒤→앞)
+        for j in range(G - 2, -1, -1):
+            dt = dt_grid[j]
+            s_over_R = S_over_R_grid[j + 1]            # (d,)
+            psi_next = psi_tab[j + 1]                  # (d,)
+            # -psi_dot = -Q x_tar + (S/R)(psi - P)
+            rhs = - self.Q_diag.squeeze(0) * self.x_tar.squeeze(0) \
+                  + s_over_R * (psi_next - price_grid[j + 1])
+            psi_tab[j] = psi_next - rhs * dt
+
+        self.register_buffer("psi_tab", psi_tab)       # (G,d)
+
+    @torch.no_grad()
     def forward(self, **states_dict):
-        X = states_dict["X"]          # (B,d)
-        t = T - states_dict["TmT"]    # (B,1)
-        price = price_fn(t)           # (B,1)
+        X   = states_dict["X"]          # (B,d)
+        TmT = states_dict["TmT"]        # (B,1) = τ
+        t   = T - TmT                   # (B,1)
+        price = price_fn(t)             # (B,1)
 
-        # 채널별 S_i(t), ψ_i(t) 계산 (실전에서는 사전 보간 테이블 사용 권장)
-        # 여기서는 근사로 S만 즉시 평가, ψ는 0으로 두어도 비교는 가능하지만 논문 1:1엔 ψ 필요
-        # 간단 버전(ψ=0 근사):
-        tau = t                        # (B,1)
-        S = torch.sqrt(self.Q_diag*self.R_diag) * torch.tanh(torch.sqrt(self.Q_diag/self.R_diag)*tau)
-        u = -(S/self.R_diag) * (X - x_target_vec) + price/self.R_diag  # ψ/R 항 생략 버전
+        # S_over_R(t) = sqrt(Q/R) * tanh( sqrt(Q/R) * (T - t) ) = sqrt(Q/R) * tanh( sqrt(Q/R) * τ )
+        sqrt_Q_over_R = torch.sqrt(self.Q_diag / self.R_diag)   # (1,d)
+        S_over_R = sqrt_Q_over_R * torch.tanh(sqrt_Q_over_R * TmT)  # (B,d)
 
+        # psi(t): 시간격자 보간 (선형보간)
+        t_flat = t.view(-1)                                     # (B,)
+        idx = torch.searchsorted(self.grid, t_flat, right=True) # ∈[0,G]
+        idx = idx.clamp(min=1, max=self.n_grid - 1)             # 보간용 안전한 인덱스
+        t0 = self.grid[idx - 1]                                 # (B,)
+        t1 = self.grid[idx]                                     # (B,)
+        w  = ((t_flat - t0) / (t1 - t0)).view(-1, 1)            # (B,1)
+
+        psi0 = self.psi_tab[idx - 1]                            # (B,d)
+        psi1 = self.psi_tab[idx]                                # (B,d)
+        psi_t = (1.0 - w) * psi0 + w * psi1                     # (B,d)
+
+        # u*(t,x) = -(S/R)(x - x_tar) - psi/R + P/R
+        u = - S_over_R * (X - self.x_tar) - psi_t / self.R_diag + price / self.R_diag
         return u
 
 def build_closed_form_policy():

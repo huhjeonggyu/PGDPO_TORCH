@@ -25,7 +25,9 @@ from pgdpo_base import (
 
 # with_projection: 반복 관련 상수 + PMP projector + 범용 costate 추정기
 from pgdpo_with_projection import (
-    REPEATS, SUBBATCH, project_pmp, estimate_costates
+    REPEATS, SUBBATCH, 
+    project_pmp, estimate_costates,
+    VERBOSE, SAMPLE_PREVIEW_N
 )
 
 # ===== 시각화: 실패 시 예외 발생 (fail-fast) =====
@@ -34,11 +36,6 @@ from viz import (
     append_metrics_csv, save_overlaid_delta_hists,
     save_loss_curve, save_loss_csv
 )
-
-# ===== 출력 제어(환경변수로 토글) =====
-VERBOSE          = os.getenv("PGDPO_VERBOSE", "1") == "1"
-SAMPLE_PREVIEW_N = int(os.getenv("PGDPO_SAMPLE_PREVIEW_N", 3))
-
 
 # ------------------------------------------------------------
 # Variance-Reduced 시뮬레이터 (학습/평가 공용): antithetic 평균
@@ -95,7 +92,7 @@ def simulate_run(
 #  - 실제 추정은 pgdpo_with_projection.estimate_costates 가 수행
 #  - 여기서는 simulate_fn으로 simulate_run을 주입
 # ------------------------------------------------------------
-def estimate_costates_anti(
+def estimate_costates_run(
     policy_net: nn.Module,
     initial_states: Dict[str, torch.Tensor],
     repeats: int,
@@ -126,7 +123,7 @@ def ppgdpo_u_run(
     needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> torch.Tensor:
     with torch.enable_grad():
-        costates = estimate_costates_anti(
+        costates = estimate_costates_run(
             policy_s1, states, repeats, sub_batch, seed_eval=seed_eval, needs=tuple(needs)
         )
         u = project_pmp(costates, states)
@@ -321,7 +318,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "simulate_run",
-    "estimate_costates_anti",
+    "estimate_costates_run",
     "ppgdpo_u_run",
     "print_policy_rmse_and_samples_run",
     "train_stage1_run",

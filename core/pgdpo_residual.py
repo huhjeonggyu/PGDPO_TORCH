@@ -23,7 +23,7 @@ from pgdpo_base import (
 
 # 고성능 러너: 분산-축소 시뮬레이터 + 평가기
 from pgdpo_run import simulate_run, print_policy_rmse_and_samples_run
-from pgdpo_with_projection import REPEATS, SUBBATCH
+from pgdpo_with_projection import REPEATS, SUBBATCH, VERBOSE, SAMPLE_PREVIEW_N
 
 try :
     from user_pgdpo_residual import MyopicPolicy
@@ -152,5 +152,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-__all__ = ["ResidualPolicy", "train_residual_stage1","MyopicPolicy"]

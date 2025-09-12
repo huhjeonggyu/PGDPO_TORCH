@@ -260,12 +260,12 @@ __all__ = [
     "CRN_SEED_EU", "N_eval_states",
     "DIM_X", "DIM_Y", "DIM_U",
     # 유틸
-    "make_generator", "set_global_seeds", "_draw_base_normals",
+    "make_generator", "_draw_base_normals",
     # 사용자 훅/심볼 재노출
-    "sample_initial_states", "simulate", "DirectPolicy",
+    "sample_initial_states", "simulate",
     # 공통 실행기/루프/비교
     "run_common",
     "train_stage1_base",
     "print_policy_rmse_and_samples_base",
-    "compare_policy_functions",
+    #"compare_policy_functions",
 ]
