@@ -31,8 +31,8 @@ seed     = int(os.getenv("PGDPO_SEED", seed_default))
 DIM_X, DIM_Y, DIM_U = d, k, d
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CRN_SEED_EU   = 777
-N_eval_states = 2048
+N_eval_states = 100
+CRN_SEED_EU   = 12345
 
 torch.manual_seed(seed); np.random.seed(seed)
 if torch.cuda.is_available():

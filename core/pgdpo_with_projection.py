@@ -20,7 +20,7 @@ import torch.nn as nn
 # ---------------------------------------------------------------------
 try:
     from user_pgdpo_base import (
-        device, N_eval_states, CRN_SEED_EU, sample_initial_states,
+        d, device, N_eval_states, CRN_SEED_EU, sample_initial_states,
     )
 except Exception as e:
     raise RuntimeError(
@@ -43,7 +43,7 @@ from viz import (
 # ---------------------------------------------------------------------
 # Defaults (env-overridable)
 # ---------------------------------------------------------------------
-REPEATS  = int(os.getenv("PGDPO_PP_REPEATS", 2560))
+REPEATS  = int(os.getenv("PGDPO_PP_REPEATS", 2560*d))
 SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 256))
 VERBOSE            = os.getenv("PGDPO_VERBOSE", "1") == "1"
 SAMPLE_PREVIEW_N   = int(os.getenv("PGDPO_SAMPLE_PREVIEW_N", 3))
@@ -246,6 +246,9 @@ def print_policy_rmse_and_samples_direct(
             sstr = ", ".join(parts)
             u_cf_val_str = f"{u_cf[i,0].item():.4f}" if u_cf is not None else "N/A"
             print(f"  ({sstr},...) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp[i,0].item():.4f}, u_cf[0]={u_cf_val_str}, ...)")
+
+
+
 
 # -----------------------------------------------------------------------------
 # 독립 실행 테스트

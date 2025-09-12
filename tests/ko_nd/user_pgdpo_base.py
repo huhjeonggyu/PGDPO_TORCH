@@ -21,6 +21,12 @@ batch_size = 1024
 lr = 1e-4
 seed = 7
 
+epochs     = 200 
+batch_size = 1024 
+lr         = 1e-4
+
+seed = 7 # pgdpo_base.py에서 이 변수를 사용해 실제 시드를 설정 <-- 상단 블록에서 제어
+
 # 2. 환경변수가 존재하면 기본값을 덮어씁니다.
 d = int(os.getenv("PGDPO_D", d))
 k = int(os.getenv("PGDPO_K", k))
@@ -46,7 +52,7 @@ DIM_U = d      # 제어 u는 d개 자산에 대한 투자 비율
 
 # --------------------------- Config ---------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# seed = 7 # pgdpo_base.py에서 이 변수를 사용해 실제 시드를 설정 <-- 상단 블록에서 제어
+
 
 # --------------------------- Market & Utility Parameters ---------------------------
 r = 0.03
@@ -61,13 +67,8 @@ X0_range = (0.1, 3.0)
 u_cap = 10.
 lb_X  = 1e-5
 
-# --------------------------- Training Hyperparameters ---------------------------
-# epochs     = 200 <-- 상단 블록에서 제어
-# batch_size = 1024 <-- 상단 블록에서 제어
-# lr         = 1e-4 <-- 상단 블록에서 제어
-
 # --------------------------- Evaluation Parameters ---------------------------
-N_eval_states = 2000
+N_eval_states = 100
 CRN_SEED_EU   = 12345
 
 # --------------------------- Parameter Generation ---------------------------
@@ -79,37 +80,50 @@ def _generate_market_params(d, k, r, dev, seed=None):
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-    # 팩터 동역학 파라미터 (k x k, k)
-    kappa_Y = torch.diag(torch.linspace(2.0, 2.0 + (k-1)*0.5, k)) if k > 0 else torch.empty(0,0)
-    theta_Y = torch.linspace(0.2, 0.4, k) if k > 0 else torch.empty(0)
-    sigma_Y = torch.diag(torch.linspace(0.3, 0.5, k)) if k > 0 else torch.empty(0,0)
+    # 팩터 동역학 파라미터 (k x k, k) — linspace → Uniform 샘플링
+    if k > 0:
+        # kappa_Y: 각 대각 성분 ~ U[2.0, 2.0 + 0.5*(k-1)]
+        kappa_min, kappa_max = 2.0, 2.0 + 0.5 * (k - 1)
+        kappa_vals = torch.empty(k).uniform_(kappa_min, kappa_max)
+        kappa_Y = torch.diag(kappa_vals)
 
-    # 자산별 파라미터 (d, d x k)
-    sigma = torch.linspace(0.2, 0.4, d)
-    # ===== [핵심 수정 2] =====
-    # Scipy 난수 생성에 random_state를 명시하여 재현성 보장
-    alpha_np = dirichlet.rvs([1.0] * k, size=d, random_state=seed) if k > 0 else np.zeros((d,0))
+        # theta_Y: 각 성분 ~ U[0.2, 0.4]
+        theta_Y = torch.empty(k).uniform_(0.2, 0.4)
+
+        # sigma_Y: 대각 각 성분 ~ U[0.3, 0.5]
+        sigmaY_vals = torch.empty(k).uniform_(0.3, 0.5)
+        sigma_Y = torch.diag(sigmaY_vals)
+    else:
+        kappa_Y = torch.empty(0, 0)
+        theta_Y = torch.empty(0)
+        sigma_Y = torch.empty(0, 0)
+
+    # 자산별 파라미터 (d,) — linspace → Uniform 샘플링
+    sigma = torch.empty(d).uniform_(0.2, 0.4)
+
+    # α ~ Dirichlet (재현성 위해 random_state 사용)
+    alpha_np = dirichlet.rvs([1.0] * k, size=d, random_state=seed) if k > 0 else np.zeros((d, 0))
     alpha = torch.tensor(alpha_np, dtype=torch.float32)
 
     # 상관관계 구조 (d x d, k x k, d x k)
     beta_corr = torch.empty(d).uniform_(-0.8, 0.8)
     Psi = torch.outer(beta_corr, beta_corr); Psi.fill_diagonal_(1.0)
-    
+
     if k > 0:
         Z_Y = torch.randn(k, max(1, k)); corr_Y = Z_Y @ Z_Y.T
         d_inv_sqrt_Y = torch.diag(1.0 / torch.sqrt(torch.diag(corr_Y).clamp(min=1e-8)))
         Phi_Y = d_inv_sqrt_Y @ corr_Y @ d_inv_sqrt_Y; Phi_Y.fill_diagonal_(1.0)
         rho_Y = torch.empty(d, k).uniform_(-0.2, 0.2)
     else:
-        Phi_Y = torch.empty(0,0)
-        rho_Y = torch.empty(d,0)
+        Phi_Y = torch.empty(0, 0)
+        rho_Y = torch.empty(d, 0)
 
     # 전체 상관 행렬 (Positive-Definite 보정 포함)
     block_corr = torch.zeros((d + k, d + k), dtype=torch.float32)
     block_corr[:d, :d], block_corr[d:, d:] = Psi, Phi_Y
     if k > 0:
         block_corr[:d, d:], block_corr[d:, :d] = rho_Y, rho_Y.T
-    
+
     eigvals = torch.linalg.eigvalsh(block_corr)
     if eigvals.min() < 1e-6:
         block_corr += (abs(eigvals.min()) + 1e-4) * torch.eye(d + k)
@@ -127,7 +141,7 @@ def _generate_market_params(d, k, r, dev, seed=None):
     params['Sigma_inv'] = torch.linalg.inv(params['Sigma'])
     params['block_corr'] = block_corr
     params['cholesky_L'] = torch.linalg.cholesky(params['block_corr'])
-    
+
     return {p_key: v.to(dev) for p_key, v in params.items()}
 
 # 파라미터 생성 실행
@@ -139,8 +153,8 @@ Sigma, Sigma_inv, block_corr, cholesky_L = params['Sigma'], params['Sigma_inv'],
 
 # Y의 평균 범위를 계산 (상태 샘플링에 사용)
 if k > 0:
-    Y_min_vec = theta_Y - 3 * torch.diag(sigma_Y)
-    Y_max_vec = theta_Y + 3 * torch.diag(sigma_Y)
+    Y_max_vec = theta_Y + 2. * torch.diag(sigma_Y)
+    Y_min_vec = torch.zeros_like(Y_max_vec)
     Y0_range = (Y_min_vec, Y_max_vec)
 else:
     Y0_range = None

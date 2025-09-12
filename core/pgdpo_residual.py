@@ -26,7 +26,7 @@ from pgdpo_run import simulate_run, print_policy_rmse_and_samples_run
 from pgdpo_with_projection import REPEATS, SUBBATCH, VERBOSE, SAMPLE_PREVIEW_N
 
 try :
-    from user_pgdpo_residual import MyopicPolicy
+    from user_pgdpo_residual import MyopicPolicy, ResCap
 except Exception as e:
     raise RuntimeError(f"[pgdpo_residual] Failed to import symbols from user_pgdpo_residual: {e}")    
 
@@ -71,7 +71,7 @@ class ResidualPolicy(nn.Module):
         # ✅ 주석도 실제 차원을 반영하도록 수정
         x_in = torch.cat(feats, dim=1)  # (B, DIM_X + DIM_Y + 1)
 
-        delta_u = self.net(x_in)
+        delta_u = ResCap*torch.sigmoid( self.net(x_in) )
         u = base_u + delta_u
             
         return u
