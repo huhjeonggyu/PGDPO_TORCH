@@ -261,88 +261,155 @@ def ppgdpo_u_direct(
 # ---------------------------------------------------------------------
 # Public evaluator (DIRECT) used by run.py or standalone main
 # ---------------------------------------------------------------------
-def print_policy_rmse_and_samples_direct(
-    pol_s1: nn.Module,
-    pol_cf: Optional[nn.Module],
-    *,
-    repeats: int = REPEATS,
-    sub_batch: int = SUBBATCH,
-    seed_eval: Optional[int] = None,
-    outdir: Optional[str] = None,
-    tile: Optional[int] = None,
-    enable_pp: bool = True,
-    prefix: str = "direct",
-    needs: Iterable[str] = ("JX", "JXX", "JXY"),
-) -> None:
+def print_policy_rmse_and_samples_direct(policy, cf_policy, **kwargs):
     """
-    DIRECT evaluator (simple/base simulator):
-      - simulate_fn = user_pgdpo_base.simulate
-      - compares: learned vs (optional) closed-form vs (optional) projected
+    DIRECT path evaluator:
+      - Samples CRN eval states via user_pgdpo_base.sample_initial_states (N_eval_states, CRN_SEED_EU)
+      - Computes u_learn, u_pp(direct), u_cf
+      - Prints RMSEs + 3 sample triplets
+      - Saves dim-0 scatter PNGs if out_dir is provided
+    Optional kwargs:
+      - out_dir (str), device (torch.device), tile (int),
+        repeats, sub_batch, seed_eval, needs  (overrides for ppgdpo_u_direct)
     """
-    # prepare eval points
-    gen = make_generator(seed_eval or CRN_SEED_EU)
-    states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
+    import os, math, numpy as np, torch
+    # headless-safe plotting (optional)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        plt = None
 
-    # learned policy output
-    u_learn = pol_s1(**states_dict)
+    # ---------- helpers ----------
+    def _as_device(x, dev, dtype=None):
+        return x.to(device=dev, dtype=(dtype or x.dtype)) if torch.is_tensor(x) else x
 
-    # projected policy (optional)
-    u_pp = None
-    if enable_pp:
-        B = next(iter(states_dict.values())).size(0)
-        divisors = _divisors_desc(B)
-        start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
-        u_pp = torch.empty_like(u_learn)
-        for idx in range(start_idx, len(divisors)):
-            cur_tile = divisors[idx]
+    def _call_cf(cf, states_slice):
+        with torch.no_grad():
             try:
-                for s in range(0, B, cur_tile):
-                    e = min(B, s + cur_tile)
-                    tile_states = {k: v[s:e] for k, v in states_dict.items()}
-                    u_pp[s:e] = ppgdpo_u_direct(
-                        pol_s1, tile_states,
-                        repeats=repeats, sub_batch=sub_batch, seed_eval=seed_eval, needs=tuple(needs)
-                    )
-                break
-            except RuntimeError as oom:
-                if "out of memory" in str(oom).lower():
-                    continue
+                return cf(**states_slice)                   # (**states)
+            except TypeError:
+                try:
+                    return cf(states_slice)                 # (states)
+                except TypeError:
+                    return cf(states_slice["X"],            # (X, TmT)
+                              states_slice.get("TmT", None))
+
+    def _rmse(a, b):
+        return float(torch.sqrt(torch.mean((a - b) ** 2)).item())
+
+    def _save_scatter_dim0(y_pred, y_true, path, title):
+        if plt is None or path is None:
+            return float("nan")
+        yp = y_pred.detach().cpu().numpy() if hasattr(y_pred, "detach") else np.asarray(y_pred)
+        yt = y_true.detach().cpu().numpy() if hasattr(y_true, "detach") else np.asarray(y_true)
+        x = np.asarray(yt[:, 0], dtype=np.float64)
+        y = np.asarray(yp[:, 0], dtype=np.float64)
+        m = np.isfinite(x) & np.isfinite(y)
+        x, y = x[m], y[m]
+        if x.size == 0:
+            return float("nan")
+        sst = np.sum((x - x.mean()) ** 2)
+        ssr = np.sum((y - x) ** 2)
+        r2 = float("nan") if sst <= 1e-12 else 1.0 - ssr / sst
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        plt.figure()
+        plt.scatter(x, y, s=6, alpha=0.6)
+        lo = float(np.min([x.min(), y.min()])); hi = float(np.max([x.max(), y.max()]))
+        plt.plot([lo, hi], [lo, hi], lw=1)
+        plt.xlabel("u_cf (dim 0)"); plt.ylabel(title)
+        plt.title(f"{title} vs CF — R^2={r2:.4f}" if math.isfinite(r2) else f"{title} vs CF — R^2=nan")
+        plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
+        return r2
+
+    # ---------- config ----------
+    out_dir   = kwargs.get("out_dir", os.getenv("PGDPO_OUT_DIR"))
+    dev       = kwargs.get("device", device)  # `device` is imported at module top from user_pgdpo_base
+    tile      = kwargs.get("tile", 4096)
+    repeats   = int(kwargs.get("repeats", REPEATS))
+    sub_batch = int(kwargs.get("sub_batch", SUBBATCH))
+    seed_eval = kwargs.get("seed_eval", CRN_SEED_EU)
+    needs     = kwargs.get("needs", PP_NEEDS)
+
+    B_eval = int(N_eval_states)
+
+    # ---------- sample eval states (CRN) ----------
+    rng = torch.Generator(device=dev.type)  # 'cuda' 또는 'cpu'
+    rng.manual_seed(int(seed_eval))
+    states_all, _ = sample_initial_states(B_eval, rng=rng)
+    for k in list(states_all.keys()):
+        states_all[k] = _as_device(states_all[k], dev)
+
+    # ---------- u_learn ----------
+    was_training = policy.training
+    policy.eval()
+    with torch.no_grad():
+        u_learn = policy(**states_all)  # (B,d)
+
+    # ---------- u_pp via direct projector ----------
+    u_pp = torch.empty_like(u_learn)
+    s = 0
+    while s < B_eval:
+        e = min(B_eval, s + tile)
+        states_slice = {k: v[s:e] for k, v in states_all.items()}
+        try:
+            u_pp[s:e] = ppgdpo_u_direct(
+                pol_s1=policy, states=states_slice,
+                repeats=repeats, sub_batch=sub_batch, seed_eval=seed_eval, needs=needs
+            )
+            s = e
+        except RuntimeError as ex:
+            msg = str(ex).lower()
+            if ("out of memory" in msg or "cuda" in msg) and tile > 256:
+                tile //= 2
+                torch.cuda.empty_cache()
+                print(f"[Eval] OOM; reducing tile -> {tile}")
+            else:
                 raise
 
-    # closed-form (optional)
-    u_cf = pol_cf(**states_dict) if pol_cf is not None else None
+    # ---------- u_cf ----------
+    if isinstance(cf_policy, (tuple, list)) and callable(cf_policy[0]):
+        cf_policy = cf_policy[0]
+    with torch.no_grad():
+        u_cf = _call_cf(cf_policy, states_all)
+        u_cf = _as_device(u_cf, dev, dtype=u_learn.dtype)
 
-    # RMSE (learn vs CF)
-    if u_cf is not None:
-        rmse = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-        print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse:.6f}")
+    # ---------- RMSE & samples ----------
+    rmse_learn = _rmse(u_learn, u_cf)
+    rmse_pp    = _rmse(u_pp,    u_cf)
+    print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
+    print(f"[Policy RMSE-PP(direct)] ||u_pp(direct) - u_closed-form||_RMSE: {rmse_pp:.6f}")
 
-    # RMSE (PP-direct vs CF) — 풍부 출력 복원
-    if enable_pp and (u_pp is not None) and (u_cf is not None):
-        rmse_pp = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
-        print(f"[Policy RMSE-PP(direct)] ||u_pp(direct) - u_closed-form||_RMSE: {rmse_pp:.6f}")
+    k_show = min(3, B_eval)
+    X  = states_all.get("X");  TmT = states_all.get("TmT")
+    for i in range(k_show):
+        if X is not None and TmT is not None:
+            x0  = float(X[i, 0].item()) if X.ndim == 2 else float(X[i].item())
+            tmt = float(TmT[i, 0].item()) if TmT.ndim == 2 else float(TmT[i].item())
+            print(f"  (X={x0:.3f}, TmT={tmt:.3f}) -> "
+                  f"(u_learn[{i}]={float(u_learn[i,0].item()):.4f}, "
+                  f"u_pp(dir)[{i}]={float(u_pp[i,0].item()):.4f}, "
+                  f"u_cf[{i}]={float(u_cf[i,0].item()):.4f})")
+        else:
+            print(f"  [{i}] -> "
+                  f"(u_learn={float(u_learn[i,0].item()):.4f}, "
+                  f"u_pp(dir)={float(u_pp[i,0].item()):.4f}, "
+                  f"u_cf={float(u_cf[i,0].item()):.4f})")
 
-    # sample preview (first N)
-    if VERBOSE and enable_pp:
-        n = min(SAMPLE_PREVIEW_N, u_learn.size(0))
-        X_vals   = _as_numpy_1d(states_dict.get("X"), 0)[:n] if "X" in states_dict else [None]*n
-        TmT_vals = _as_numpy_1d(states_dict.get("TmT"), 0)[:n] if "TmT" in states_dict else [None]*n
-        uL = _as_numpy_1d(u_learn, PRINT_COORD)[:n]
-        uP = _as_numpy_1d(u_pp,    PRINT_COORD)[:n] if u_pp is not None else [None]*n
-        uC = _as_numpy_1d(u_cf,    PRINT_COORD)[:n] if u_cf is not None else [None]*n
-        for i in range(n):
-            if u_pp is not None and u_cf is not None:
-                print(f"  (X={X_vals[i]:.3f}, TmT={TmT_vals[i]:.3f}) -> "
-                      f"(u_learn[{i}]={uL[i]:.4f}, u_pp(dir)[{i}]={uP[i]:.4f}, u_cf[{i}]={uC[i]:.4f})")
-            elif u_pp is not None:
-                print(f"  (X={X_vals[i]:.3f}, TmT={TmT_vals[i]:.3f}) -> "
-                      f"(u_learn[{i}]={uL[i]:.4f}, u_pp(dir)[{i}]={uP[i]:.4f})")
-            elif u_cf is not None:
-                print(f"  (X={X_vals[i]:.3f}, TmT={TmT_vals[i]:.3f}) -> "
-                      f"(u_learn[{i}]={uL[i]:.4f}, u_cf[{i}]={uC[i]:.4f})")
+    # ---------- force-save scatters (if out_dir provided) ----------
+    if out_dir:
+        p0 = os.path.join(out_dir, "scatter_projection_learn_vs_cf_dim0.png")
+        p1 = os.path.join(out_dir, "scatter_projection_pp_vs_cf_dim0.png")
+        r2_learn = _save_scatter_dim0(u_learn, u_cf, p0, "u_learn")
+        r2_pp    = _save_scatter_dim0(u_pp,    u_cf, p1, "u_pp(direct)")
+        if math.isfinite(r2_learn) or math.isfinite(r2_pp):
+            print(f"[Scatter] saved:\n  {p0} (R^2={r2_learn:.4f})\n  {p1} (R^2={r2_pp:.4f})")
 
-    # overlay deltas (optional viz)
-    _save_overlaid_deltas_safe(u_learn, u_pp, u_cf, outdir, coord=PRINT_COORD, fname=f"{prefix}_delta_overlaid_hist.png")
+    if was_training:
+        policy.train()
+
 
 # -----------------------------------------------------------------------------
 # 독립 실행 테스트

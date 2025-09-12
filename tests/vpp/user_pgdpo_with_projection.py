@@ -1,24 +1,22 @@
 # tests/vpp/user_pgdpo_with_projection.py
 import torch
-# ✨ user_pgdpo_base에서 R_diag와 가격 함수를 가져옴
 from user_pgdpo_base import R_diag, price_fn, T
 
 PP_NEEDS = ("JX",)
 
-def project_pmp(costates: dict, states: dict) -> torch.Tensor:
-    """
-    ✨ 수정된 PMP 프로젝션 공식 (논문 식 15)
-    u*_i = (P(t) + p_i) / R_i
-    """
-    JX = costates['JX']  # Co-state p와 같은 의미로 사용, shape: (B, d)
-    TmT = states['TmT']  # shape: (B, 1)
-    t = T - TmT          # 현재 시간
+@torch.no_grad()
+def project_pmp(costates, states):
+    # p_hat ≡ JX = ∂(-profit)/∂x = -p  →  u = R^{-1}(P + JX)
+    p_hat  = costates if torch.is_tensor(costates) else costates["JX"]   # (B,d)
+    device, dtype = p_hat.device, p_hat.dtype
 
-    price = price_fn(t)  # 현재 가격 P(t), shape: (B, 1)
+    # t 처리: states에 't'가 있으면 그대로, 없으면 T - TmT
+    if isinstance(states, dict) and "t" in states:
+        t = states["t"].to(device=device, dtype=dtype)
+    else:
+        TmT = states["TmT"].to(device=device, dtype=dtype)               # (B,1) = T - t
+        t   = (T - TmT).clamp_min(0.0)                                    # (B,1)
 
-    # 각 차원별로 연산
-    # (B,1) + (B,d) -> (B,d) (브로드캐스팅)
-    # (B,d) / (d,)    -> (B,d) (브로드캐스팅)
-    u = (price - JX) / R_diag.view(1, -1)
-    
-    return u
+    P  = price_fn(t).to(device=device, dtype=dtype).expand_as(p_hat)      # (B,d)
+    Rinv = (1.0 / R_diag).to(device=device, dtype=dtype).view(1, -1)      # (1,d)
+    return (P + p_hat) * Rinv                                             # (B,d)
