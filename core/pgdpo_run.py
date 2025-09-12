@@ -148,9 +148,11 @@ def print_policy_rmse_and_samples_run(
     seed_eval: int | None = None,
     outdir: str | None = None,
     tile: int | None = None,
-    enable_pp: bool = True,         # pp(P-PGDPO) 계산 여부
-    prefix: str = "run",            # 파일명 접두어 ("run"/"base" 등)
+    enable_pp: bool = True,
+    prefix: str = "run",
     needs: Iterable[str] = ("JX", "JXX", "JXY"),
+    save_teacher_data_path: str | None = None, # <-- ✨ 1. 데이터셋 저장 경로 인자 추가
+    n_samples_override: int | None = None,     # <-- ✨ 2. 데이터셋 생성을 위한 샘플 수 오버라이드
 ) -> None:
     """
     Variance-reduced 'run' 모드 평가기.
@@ -158,12 +160,15 @@ def print_policy_rmse_and_samples_run(
     - (옵션) u_pp = ppgdpo_u_run(...)  (타일링으로 OOM 방지; enable_pp=False면 생략)
     - (있으면) u_cf = pol_cf(**states)
     - RMSE 출력 + (겹침) 히스토그램/산점도 저장 + 샘플 프리뷰
+    - ✨ (옵션) save_teacher_data_path가 지정되면 (상태, u_pp) 데이터셋 저장
     """
     # RNG & states
+    # 데이터셋 생성을 위해 N_eval_states보다 더 많은 샘플이 필요할 수 있음
+    num_samples = n_samples_override if n_samples_override is not None else N_eval_states
     gen = make_generator(seed_eval or CRN_SEED_EU)
-    states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
+    states_dict, _ = sample_initial_states(num_samples, rng=gen)
 
-    # 학습 정책 출력
+    # 학습 정책 출력 (데이터셋 생성 시에는 u_learn이 필요 없지만, 일반 평가를 위해 유지)
     u_learn = pol_s1(**states_dict)
 
     # (옵션) P-PGDPO 사영 정책 계산 (OOM 방지 타일링)
@@ -178,6 +183,8 @@ def print_policy_rmse_and_samples_run(
             try:
                 for s in range(0, B, cur_tile):
                     e = min(B, s + cur_tile)
+                    if s % (cur_tile * 10) == 0: # 진행 상황 표시
+                        print(f"  - Projecting samples {s} to {e}...")
                     tile_states = {k: v[s:e] for k, v in states_dict.items()}
                     u_pp_run[s:e] = ppgdpo_u_run(
                         pol_s1, tile_states, repeats, sub_batch,
@@ -201,7 +208,27 @@ def print_policy_rmse_and_samples_run(
     # 폐형해 로드
     u_cf = pol_cf(**states_dict) if pol_cf is not None else None
 
-    # ====== RMSE 출력 및 메트릭 저장 ======
+    # ====== ✨ 3. 데이터셋 저장 로직 추가 ✨ ======
+    if save_teacher_data_path and u_pp_run is not None:
+        print(f"\n[Teacher Data] Saving teacher dataset to: {save_teacher_data_path}")
+        # user_pgdpo_base의 입력 형식에 맞게 상태 텐서들을 하나의 텐서로 결합
+        state_tensors = [states_dict['X'], states_dict['TmT']]
+        if 'Y' in states_dict and states_dict['Y'] is not None:
+            state_tensors.append(states_dict['Y'])
+        combined_states = torch.cat(state_tensors, dim=1)
+
+        torch.save({
+            'states': combined_states.cpu(),
+            'u_teacher': u_pp_run.cpu(),
+        }, save_teacher_data_path)
+        print(f"[Teacher Data] Successfully saved {u_pp_run.size(0)} samples.")
+    
+    # 데이터셋 생성 모드일 경우, RMSE 계산 등 이후 과정은 건너뛸 수 있음
+    if n_samples_override is not None:
+        print("[Teacher Data] Dataset generation finished. Skipping further evaluation.")
+        return
+
+    # ====== RMSE 출력 및 메트릭 저장 (이하 기존과 동일) ======
     if u_cf is not None:
         rmse_learn = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
         print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")

@@ -170,8 +170,12 @@ class ClosedFormPolicy(nn.Module):
             return torch.clamp((1.0 / self.gamma) * myopic.T, -self.u_cap, self.u_cap)
 
         # 1. 현재 시간에 맞는 B, C 값 추출 (NumPy)
-        tau = self.T - TmT.cpu().numpy().flatten()
-        z = self.sol.sol(tau).T # (batch, k*k + k)
+        #tau = self.T - TmT.cpu().numpy().flatten()
+        #z = self.sol.sol(tau).T # (batch, k*k + k)
+        tau = TmT.detach().cpu().numpy().flatten()
+        # 수치 안전을 위해 [0, self.T]로 잘라줍니다.
+        tau = np.clip(tau, 0.0, float(self.T))
+        z = self.sol.sol(tau).T  # (batch, k*k + k)
         
         # 2. NumPy 결과를 PyTorch 텐서로 변환
         C_flat, B_flat = z[:, :self.k**2], z[:, self.k**2:]

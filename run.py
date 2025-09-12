@@ -80,6 +80,9 @@ def orchestrate_all(*, model: str, gpus: List[int], plots_base: str, cli_args: a
 # ---------------------------------------------------------------------
 # 단일 실행 로직
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 단일 실행 로직
+# ---------------------------------------------------------------------
 def single_run(
     *,
     mode_key: str,
@@ -92,7 +95,8 @@ def single_run(
     epochs_override: Optional[int] = None,
     batch_size_override: Optional[int] = None,
     lr_override: Optional[float] = None,
-    seed_override: Optional[int] = None
+    seed_override: Optional[int] = None,
+    generate_teacher_data: bool = False  # <-- ✨ 1. 인자 추가
 ) -> None:
     # ✨✨✨ 수정된 부분 ✨✨✨
     # 현재 실행 모드를 환경 변수로 설정하여 다른 모듈(traj.py)이 알 수 있도록 합니다.
@@ -145,6 +149,19 @@ def single_run(
     update_latest_link(base_mode_dir, OUT_DIR)
     from pgdpo_base import run_common
     rmse_kwargs = {"seed_eval": CRN_SEED_EU, "outdir": OUT_DIR}
+
+    # ✨ 2. 데이터 생성 플래그에 따라 rmse_kwargs를 동적으로 설정
+    if generate_teacher_data:
+        # run 또는 projection 모드에서만 데이터 생성이 의미 있음
+        if mode_key not in ["run", "projection"]:
+            print("[WARN] Teacher data generation is only meaningful in 'run' or 'projection' mode. Ignoring.")
+        else:
+            print("[INFO] Teacher data generation mode enabled.")
+            # 평가 샘플 수를 대폭 늘림
+            rmse_kwargs['n_samples_override'] = 200000  # 예시: 20만개
+            # 데이터셋을 저장할 경로 지정
+            rmse_kwargs['save_teacher_data_path'] = os.path.join(OUT_DIR, "teacher_dataset.pt")
+
     if mode_key == "run":
         from pgdpo_run import train_stage1_run, print_policy_rmse_and_samples_run
         from pgdpo_with_projection import REPEATS, SUBBATCH
@@ -158,12 +175,13 @@ def single_run(
     elif mode_key == "base":
         from pgdpo_base import train_stage1_base, print_policy_rmse_and_samples_base
         train_fn, rmse_fn = train_stage1_base, print_policy_rmse_and_samples_base
-    else:
+    else: # residual
         from pgdpo_residual import train_residual_stage1
         from pgdpo_run import print_policy_rmse_and_samples_run
         from pgdpo_with_projection import REPEATS, SUBBATCH
         train_fn, rmse_fn = train_residual_stage1, print_policy_rmse_and_samples_run
         rmse_kwargs.update({"repeats": REPEATS, "sub_batch": SUBBATCH})
+    
     run_common(train_fn=train_fn, rmse_fn=rmse_fn, seed_train=None, train_kwargs={"outdir": OUT_DIR}, rmse_kwargs=rmse_kwargs)
     write_text(os.path.join(OUT_DIR, "_DONE"), "ok\n")
 
@@ -182,6 +200,10 @@ def main():
     parser.add_argument("--gpu", type=str, default=None, help="GPU index or CSV list for --all mode (e.g., 0 or 0,1,2). Use -1 for CPU.")
     parser.add_argument("--plots", type=str, default="plots", help="Base plots directory")
     parser.add_argument("--tag", type=str, default=None, help="Optional tag for output folder name")
+    
+    # ✨ 3. 데이터 생성 플래그 추가
+    parser.add_argument("--generate-teacher-data", action='store_true', help="Generate and save a dataset for distillation. Use with --run or --projection.")
+
     parser.add_argument("-d", type=int, dest="d_override", default=None, help="Override dimension 'd'")
     parser.add_argument("-k", type=int, dest="k_override", default=None, help="Override dimension 'k'")
     parser.add_argument("--epochs", type=int, dest="epochs_override", default=None, help="Override training epochs")
@@ -200,10 +222,14 @@ def main():
     else: MODE = "residual"
     gpu_sel = "cuda" if torch.cuda.is_available() else "cpu"
     if args.gpu is not None: gpu_sel = "cpu" if args.gpu == "-1" else f"cuda:{parse_gpu_list(args.gpu)[0]}"
+    
+    # ✨ 4. 파싱된 generate_teacher_data 값을 single_run에 전달
     single_run(
         mode_key=MODE, model=args.model, gpu_sel=gpu_sel, plots_base=args.plots, tag=args.tag,
         d_override=args.d_override, k_override=args.k_override, epochs_override=args.epochs_override,
-        batch_size_override=args.batch_size_override, lr_override=args.lr_override, seed_override=args.seed_override
+        batch_size_override=args.batch_size_override, lr_override=args.lr_override, seed_override=args.seed_override,
+        generate_teacher_data=args.generate_teacher_data
     )
+
 if __name__ == "__main__":
     main()
