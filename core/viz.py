@@ -1,8 +1,6 @@
 # core/viz.py
 # 역할: 결과 시각화/로그 유틸
-# - matplotlib만 사용, 플롯당 하나의 차트
-# - 색상 지정하지 않음(기본값 사용)
-# - 서버 환경(headless)에서도 파일 저장 가능하도록 Agg 사용
+# - [수정] u_learn, u_pp, u_cf를 하나의 산점도에 그리는 기능 추가
 
 from __future__ import annotations
 
@@ -19,7 +17,7 @@ import matplotlib.pyplot as plt
 
 
 # ------------------------------------------------------------
-# 내부 유틸
+# 내부 유틸 (변경 없음)
 # ------------------------------------------------------------
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
@@ -66,112 +64,65 @@ def _compute_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 # ------------------------------------------------------------
-# 산점도 (R^2 주석 포함)
+# ✨ [업데이트] 통합 산점도 (R^2 주석 포함)
 # ------------------------------------------------------------
-def save_policy_scatter(
+def save_combined_scatter(
     *,
     u_ref: torch.Tensor | np.ndarray,
-    u_pred: torch.Tensor | np.ndarray,
+    u_learn: torch.Tensor | np.ndarray,
+    u_pp: Optional[torch.Tensor | np.ndarray],
     outdir: str,
     fname: str,
     coord: int = 0,
-    xlabel: str = "reference",
-    ylabel: str = "prediction",
+    xlabel: str = "u_closed-form",
     title: Optional[str] = None,
 ) -> str:
     """
-    u_ref vs u_pred 산점도 저장. 그림에 R^2를 주석으로 표기.
+    u_learn vs u_ref와 u_pp vs u_ref를 하나의 산점도에 겹쳐 그립니다.
+    각각의 R^2 값을 계산하여 범례(legend)에 함께 표시합니다.
     """
     _ensure_dir(outdir)
 
-    x = _as_numpy_1d(u_ref, coord=coord)
-    y = _as_numpy_1d(u_pred, coord=coord)
-    r2 = _compute_r2(x, y)
-
-    fig = plt.figure(figsize=(5.0, 5.0))
+    x_ref = _as_numpy_1d(u_ref, coord=coord)
+    y_learn = _as_numpy_1d(u_learn, coord=coord)
+    
+    fig = plt.figure(figsize=(6.5, 6.5))
     ax = fig.add_subplot(111)
-    ax.scatter(x, y, s=10)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    if title:
-        ax.set_title(title)
 
-    lo = min(np.min(x), np.min(y))
-    hi = max(np.max(x), np.max(y))
-    ax.plot([lo, hi], [lo, hi])
+    # u_learn vs u_cf 플롯
+    r2_learn = _compute_r2(x_ref, y_learn)
+    ax.scatter(x_ref, y_learn, s=15, alpha=0.7, label=f"Learned (R²={r2_learn:.4f})", zorder=2)
 
-    # R^2 주석 - 소수점 8자리까지 표시하도록 수정
-    ax.text(
-        0.02, 0.98,
-        f"R² = {r2:.8f}",
-        transform=ax.transAxes,
-        ha="left", va="top",
-    )
-
-    out_path = os.path.join(outdir, fname)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
-
-
-# ------------------------------------------------------------
-# 히스토그램 (단일 쌍)
-# ------------------------------------------------------------
-def save_delta_hist(
-    *,
-    u_a: torch.Tensor | np.ndarray,
-    u_b: torch.Tensor | np.ndarray,
-    outdir: str,
-    fname: str,
-    label: Optional[str] = None,
-    coord: int = 0,
-    bins: int = 50,
-) -> str:
-    _ensure_dir(outdir)
-    a = _as_numpy_1d(u_a, coord=coord)
-    b = _as_numpy_1d(u_b, coord=coord)
-    delta = a - b
-    fig = plt.figure(figsize=(6.0, 4.0))
-    ax = fig.add_subplot(111)
-    ax.hist(delta, bins=bins)
-    ax.set_xlabel(label or "delta")
-    ax.set_ylabel("count")
-    mu = float(np.mean(delta))
-    sd = float(np.std(delta))
-    ax.set_title(f"mean={mu:.4f}, std={sd:.4f}")
-    out_path = os.path.join(outdir, fname)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
-
-
-# ------------------------------------------------------------
-# 히스토그램 (closed-form 있을 때 3쌍 자동 저장)
-# ------------------------------------------------------------
-def save_pairwise_hists(
-    *,
-    u_learn: torch.Tensor | np.ndarray,
-    u_pp: Optional[torch.Tensor | np.ndarray],
-    u_cf: Optional[torch.Tensor | np.ndarray],
-    outdir: str,
-    coord: int = 0,
-    prefix: str = "delta",
-    bins: int = 50,
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    p1 = p2 = p3 = None
+    # u_pp vs u_cf 플롯 (u_pp가 있을 경우)
     if u_pp is not None:
-        p1 = save_delta_hist(u_a=u_learn, u_b=u_pp, outdir=outdir, coord=coord, bins=bins, fname=f"{prefix}_learn_minus_pp_hist.png", label="u_learn - u_pp")
-    if u_cf is not None:
-        p2 = save_delta_hist(u_a=u_learn, u_b=u_cf, outdir=outdir, coord=coord, bins=bins, fname=f"{prefix}_learn_minus_cf_hist.png", label="u_learn - u_cf")
-    if (u_pp is not None) and (u_cf is not None):
-        p3 = save_delta_hist(u_a=u_pp, u_b=u_cf, outdir=outdir, coord=coord, bins=bins, fname=f"{prefix}_pp_minus_cf_hist.png", label="u_pp - u_cf")
-    return p1, p2, p3
+        y_pp = _as_numpy_1d(u_pp, coord=coord)
+        r2_pp = _compute_r2(x_ref, y_pp)
+        ax.scatter(x_ref, y_pp, s=15, alpha=0.7, label=f"P-PGDPO (R²={r2_pp:.4f})", zorder=3)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Policy Output")
+    ax.set_title(title or f"Policy Comparison (dim {coord})")
+
+    # y=x 기준선
+    all_vals_list = [x_ref, y_learn]
+    if u_pp is not None:
+        all_vals_list.append(_as_numpy_1d(u_pp, coord=coord))
+    all_vals = np.concatenate(all_vals_list)
+    lo, hi = np.min(all_vals), np.max(all_vals)
+    ax.plot([lo, hi], [lo, hi], 'k--', lw=1.5, label="y=x (Perfect Match)", zorder=4)
+
+    ax.legend(loc="best")
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    out_path = os.path.join(outdir, fname)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
 
 
 # ------------------------------------------------------------
-# 오버레이 히스토그램
+# 오버레이 히스토그램 (기존과 동일)
 # ------------------------------------------------------------
 def save_overlaid_delta_hists(
     *,
@@ -191,21 +142,13 @@ def save_overlaid_delta_hists(
         x = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
         return x[:, coord] if x.ndim == 2 else x
 
-    if include_learn_pp and (u_pp is not None):
-        series.append(("learn - pp", _as1(u_learn) - _as1(u_pp)))
     if u_cf is not None:
-        series.append(("learn - cf", _as1(u_learn) - _as1(u_cf)))
+        series.append(("Learned vs Closed-Form", _as1(u_learn) - _as1(u_cf)))
     if (u_pp is not None) and (u_cf is not None):
-        series.append(("pp - cf", _as1(u_pp) - _as1(u_cf)))
+        series.append(("P-PGDPO vs Closed-Form", _as1(u_pp) - _as1(u_cf)))
 
     if not series:
-        fig, ax = plt.subplots(figsize=(6.0, 4.0))
-        ax.set_title("No deltas available")
-        out_path = os.path.join(outdir, fname)
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=150)
-        plt.close(fig)
-        return out_path
+        return ""
 
     all_vals = np.concatenate([s[1] for s in series], axis=0)
     lo, hi = float(np.min(all_vals)), float(np.max(all_vals))
@@ -218,7 +161,7 @@ def save_overlaid_delta_hists(
         ax.hist(vals, bins=edges, density=density, histtype="step", linewidth=1.5, label=f"{label} (μ={mu:.3f}, σ={sd:.3f})")
 
     ax.axvline(0.0, linestyle="--", linewidth=1.0)
-    ax.set(xlabel="delta", ylabel="density" if density else "count", title=f"Overlaid policy deltas (dim {coord})")
+    ax.set(xlabel="Policy Difference (Delta)", ylabel="Density" if density else "Count", title=f"Overlaid Policy Deltas (dim {coord})")
     ax.legend(loc="best")
     out_path = os.path.join(outdir, fname)
     fig.tight_layout()
@@ -227,25 +170,8 @@ def save_overlaid_delta_hists(
     return out_path
 
 
-def save_pairwise_scatters(
-    *,
-    u_learn: torch.Tensor | np.ndarray,
-    u_pp: Optional[torch.Tensor | np.ndarray],
-    u_cf: Optional[torch.Tensor | np.ndarray],
-    outdir: str,
-    coord: int = 0,
-    prefix: str = "scatter",
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    p1, p2, p3 = None, None, None
-    if u_cf is not None:
-        p2 = save_policy_scatter(u_ref=u_cf, u_pred=u_learn, outdir=outdir, coord=coord, fname=f"{prefix}_learn_vs_cf_dim{coord}.png", xlabel="u_cf", ylabel="u_learn")
-    if (u_pp is not None) and (u_cf is not None):
-        p3 = save_policy_scatter(u_ref=u_cf, u_pred=u_pp, outdir=outdir, coord=coord, fname=f"{prefix}_pp_vs_cf_dim{coord}.png", xlabel="u_cf", ylabel="u_pp")
-    return p1, p2, p3
-
-
 # ------------------------------------------------------------
-# 손실 곡선/CSV, 메트릭 CSV
+# 손실 곡선/CSV, 메트릭 CSV (기존과 동일)
 # ------------------------------------------------------------
 def save_loss_curve(loss_hist: list[float], outdir: str, fname: str = "loss_curve.png") -> str:
     _ensure_dir(outdir)
@@ -283,6 +209,8 @@ def append_metrics_csv(metrics: Dict[str, Any], outdir: str, fname: str = "metri
     new_keys = [k for k in metrics if k not in header]
     header.extend(new_keys)
     
+    # metrics 딕셔너리를 rows의 마지막에 추가하거나 업데이트
+    # (tag가 같으면 업데이트, 없으면 추가하는 로직이 필요할 수 있으나 여기서는 단순 추가)
     new_row = {k: metrics.get(k, "") for k in header}
     rows.append(new_row)
     
@@ -294,6 +222,6 @@ def append_metrics_csv(metrics: Dict[str, Any], outdir: str, fname: str = "metri
 
 
 __all__ = [
-    "save_policy_scatter", "save_delta_hist", "save_pairwise_hists", "save_overlaid_delta_hists",
-    "save_loss_curve", "save_loss_csv", "save_pairwise_scatters", "append_metrics_csv", "_ensure_dir",
+    "save_combined_scatter", "save_overlaid_delta_hists",
+    "save_loss_curve", "save_loss_csv", "append_metrics_csv", "_ensure_dir",
 ]

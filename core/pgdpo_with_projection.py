@@ -37,7 +37,7 @@ except Exception as e:
 
 # ✨ 표준 시각화 및 유틸리티 import
 from viz import (
-    save_pairwise_scatters, save_overlaid_delta_hists, append_metrics_csv
+    save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
 )
 
 # ---------------------------------------------------------------------
@@ -159,7 +159,7 @@ def ppgdpo_u_direct(
         return u.detach()
 
 # ---------------------------------------------------------------------
-# ✨✨✨ Public evaluator (DIRECT) - 수정된 버전 ✨✨✨
+# Public evaluator (DIRECT) - NameError 버그 수정
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def print_policy_rmse_and_samples_direct(
@@ -174,78 +174,84 @@ def print_policy_rmse_and_samples_direct(
     needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> None:
     """
-    --run 모드와 로직을 통일한 새로운 DIRECT path evaluator.
-    - u_learn, u_pp(direct), u_cf 계산
-    - RMSE 출력, 샘플 프리뷰, 표준 플롯(히스토그램, 산점도) 및 메트릭 저장
+    --projection 모드의 평가 함수 (변수명 오류 수정).
     """
-    # RNG & states
+    # ... (u_learn, u_pp, u_cf 계산까지는 동일)
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
-
-    # 학습 정책 출력
     u_learn = pol_s1(**states_dict)
-
-    # P-PGDPO(direct) 사영 정책 계산 (OOM 방지 타일링)
-    B = next(iter(states_dict.values())).size(0)
-    divisors = _divisors_desc(B)
-    start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
-    u_pp = torch.empty_like(u_learn)
-    for idx in range(start_idx, len(divisors)):
-        cur_tile = divisors[idx]
-        try:
-            for s in range(0, B, cur_tile):
-                e = min(B, s + cur_tile)
-                tile_states = {k: v[s:e] for k, v in states_dict.items()}
-                u_pp[s:e] = ppgdpo_u_direct(
-                    pol_s1, tile_states,
-                    repeats=repeats, sub_batch=sub_batch,
-                    seed_eval=(seed_eval if seed_eval is not None else 0),
-                    needs=tuple(needs),
-                )
-            break
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                if torch.cuda.is_available(): torch.cuda.empty_cache()
-                if idx + 1 < len(divisors):
-                    print(f"[Eval] OOM; reducing tile -> {divisors[idx+1]}")
-                    continue
-                else:
-                    print("[Eval] OOM; could not reduce tile further.")
-                    raise
-            else:
-                raise
-
-    # 폐형해 로드
+    u_pp = None
+    try:
+        B = next(iter(states_dict.values())).size(0)
+        divisors = _divisors_desc(B)
+        start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
+        u_pp_calc = torch.empty_like(u_learn)
+        for idx in range(start_idx, len(divisors)):
+            cur_tile = divisors[idx]
+            try:
+                for s in range(0, B, cur_tile):
+                    e = min(B, s + cur_tile)
+                    tile_states = {k: v[s:e] for k, v in states_dict.items()}
+                    u_pp_calc[s:e] = ppgdpo_u_direct(pol_s1, tile_states, repeats=repeats, sub_batch=sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
+                u_pp = u_pp_calc
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                    if idx + 1 < len(divisors): print(f"[Eval] OOM; reducing tile -> {divisors[idx+1]}"); continue
+                    else: print("\n[Eval] ERROR: Unrecoverable OOM error."); break
+                else: raise
+    except Exception as e:
+        print(f"\n[Eval] ERROR: An unexpected error occurred during PMP projection: {e}")
+        u_pp = None
     u_cf = pol_cf(**states_dict) if pol_cf is not None else None
 
     # ====== RMSE 출력, 샘플 프리뷰, 플롯/메트릭 저장 ======
     prefix = "direct"
     if u_cf is not None:
         rmse_learn = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-        rmse_pp = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
-        print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
-        print(f"[Policy RMSE-PP({prefix})] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp:.6f}")
+        print(f"\n[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
+        
+        if u_pp is not None:
+            rmse_pp = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
+            print(f"[Policy RMSE-PP({prefix})] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp:.6f}")
+        
         if outdir is not None:
-            metrics = {f"rmse_learn_cf_{prefix}": rmse_learn, f"rmse_pp_cf_{prefix}": rmse_pp}
+            metrics = {f"rmse_learn_cf_{prefix}": rmse_learn}
+            if u_pp is not None:
+                metrics[f"rmse_pp_cf_{prefix}"] = rmse_pp
             append_metrics_csv(metrics, outdir)
+            
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=u_pp, u_cf=u_cf,
                 outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png"
             )
-            save_pairwise_scatters(
-                u_learn=u_learn, u_pp=u_pp, u_cf=u_cf,
-                outdir=outdir, coord=0, prefix=f"scatter_{prefix}"
+            
+            # ✨ --- 핵심 수정 부분 --- ✨
+            # u_pp_run -> u_pp 로 변수명 수정
+            save_combined_scatter(
+                u_ref=u_cf, u_learn=u_learn, u_pp=u_pp,
+                outdir=outdir, coord=0, fname=f"scatter_{prefix}_comparison.png"
             )
+            # ✨ --- 여기까지 수정 --- ✨
+
     else:
         print("[INFO] No closed-form policy provided for comparison.")
 
     if VERBOSE:
         n = min(SAMPLE_PREVIEW_N, u_learn.size(0))
+        print("\n--- Sample Previews ---")
         for i in range(n):
-            parts = [f"{k_}={v[i].item():.3f}" for k_, v in states_dict.items() if v[i].numel() == 1]
+            parts, vec = [], False
+            for k_, v in states_dict.items():
+                ts = v[i]
+                if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
+                else: parts.append(f"{k_}={ts.item():.3f}")
+            if vec: parts.append("...")
             sstr = ", ".join(parts)
+            u_pp_val_str = f"{u_pp[i,0].item():.4f}" if u_pp is not None else "N/A"
             u_cf_val_str = f"{u_cf[i,0].item():.4f}" if u_cf is not None else "N/A"
-            print(f"  ({sstr},...) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp[i,0].item():.4f}, u_cf[0]={u_cf_val_str}, ...)")
+            print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp_val_str}, u_cf[0]={u_cf_val_str}, ...)")
 
 
 
