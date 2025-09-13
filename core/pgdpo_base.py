@@ -186,10 +186,11 @@ def print_policy_rmse_and_samples_base(
 
     if outdir is not None:
         try:
-            from viz import save_policy_scatter, save_overlaid_delta_hists, append_metrics_csv
-            save_policy_scatter(
-                u_ref=u_cf, u_pred=u_learn, outdir=outdir, coord=0,
-                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf", ylabel="u_learn",
+            from viz import save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
+            save_combined_scatter(
+                u_ref=u_cf, u_learn=u_learn, u_pp=None,  # u_pp=None으로 전달
+                outdir=outdir, coord=0,
+                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf"
             )
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=None, u_cf=u_cf,
@@ -238,10 +239,11 @@ def compare_policy_functions(
 
     if outdir is not None:
         try:
-            from viz import save_policy_scatter, save_overlaid_delta_hists, append_metrics_csv
-            save_policy_scatter(
-                u_ref=u_cf, u_pred=u_learn, outdir=outdir, coord=0,
-                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf", ylabel="u_learn",
+            from viz import save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
+            save_combined_scatter(
+                u_ref=u_cf, u_learn=u_learn, u_pp=None,  # u_pp=None으로 전달
+                outdir=outdir, coord=0,
+                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf"
             )
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=None, u_cf=u_cf,

@@ -74,74 +74,7 @@ lb_X     = 1e-5
 N_eval_states = 100
 CRN_SEED_EU   = 12345
 
-# --------------------------- Parameter Generation ---------------------------
-def _generate_market_params(d, k, r, dev, seed=None):
-    """다차원 시장 파라미터를 생성하고 torch 텐서로 반환합니다."""
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-
-    # 팩터 동역학 파라미터
-    if k > 0:
-        kappa_min, kappa_max = 2.0, 2.0 + 0.5 * (k - 1)
-        kappa_vals = torch.empty(k).uniform_(kappa_min, kappa_max)
-        kappa_Y = torch.diag(kappa_vals)
-
-        theta_Y = torch.empty(k).uniform_(0.2, 0.4)
-        sigmaY_vals = torch.empty(k).uniform_(0.3, 0.5)
-        sigma_Y = torch.diag(sigmaY_vals)
-    else:
-        kappa_Y = torch.empty(0, 0)
-        theta_Y = torch.empty(0)
-        sigma_Y = torch.empty(0, 0)
-
-    # 자산별 변동성
-    sigma = torch.empty(d).uniform_(0.2, 0.4)
-
-    # α ~ Dirichlet
-    alpha_np = dirichlet.rvs([1.0] * k, size=d, random_state=seed) if k > 0 else np.zeros((d, 0))
-    alpha = torch.tensor(alpha_np, dtype=torch.float32)
-
-    # 상관 구조
-    beta_corr = torch.empty(d).uniform_(-0.8, 0.8)
-    Psi = torch.outer(beta_corr, beta_corr); Psi.fill_diagonal_(1.0)
-
-    if k > 0:
-        Z_Y = torch.randn(k, max(1, k)); corr_Y = Z_Y @ Z_Y.T
-        d_inv_sqrt_Y = torch.diag(1.0 / torch.sqrt(torch.diag(corr_Y).clamp(min=1e-8)))
-        Phi_Y = d_inv_sqrt_Y @ corr_Y @ d_inv_sqrt_Y; Phi_Y.fill_diagonal_(1.0)
-        rho_Y = torch.empty(d, k).uniform_(-0.2, 0.2)
-    else:
-        Phi_Y = torch.empty(0, 0)
-        rho_Y = torch.empty(d, 0)
-
-    # 블록 상관행렬 SPD 보정
-    block_corr = torch.zeros((d + k, d + k), dtype=torch.float32)
-    block_corr[:d, :d], block_corr[d:, d:] = Psi, Phi_Y
-    if k > 0:
-        block_corr[:d, d:], block_corr[d:, :d] = rho_Y, rho_Y.T
-
-    eigvals = torch.linalg.eigvalsh(block_corr)
-    if eigvals.min() < 1e-6:
-        block_corr += (abs(eigvals.min()) + 1e-4) * torch.eye(d + k)
-        D_inv_sqrt = torch.diag(1.0 / torch.sqrt(torch.diag(block_corr)))
-        block_corr = D_inv_sqrt @ block_corr @ D_inv_sqrt
-        Psi = block_corr[:d, :d]
-        if k > 0:
-            Phi_Y, rho_Y = block_corr[d:, d:], block_corr[:d, d:]
-
-    params = {
-        'kappa_Y': kappa_Y, 'theta_Y': theta_Y, 'sigma_Y': sigma_Y,
-        'sigma': sigma, 'alpha': alpha, 'Phi_Y': Phi_Y, 'Psi': Psi, 'rho_Y': rho_Y
-    }
-    params['Sigma']       = torch.diag(params['sigma']) @ params['Psi'] @ torch.diag(params['sigma'])
-    params['Sigma_inv']   = torch.linalg.inv(params['Sigma'])
-    params['block_corr']  = block_corr
-    params['cholesky_L']  = torch.linalg.cholesky(params['block_corr'])
-    return {k_: v.to(dev) for k_, v in params.items()}
-
 # ====== Reasonable Market Generator (선택: 필요 시 교체 사용) ======
-import torch  # (이미 임포트 되어 있지만, 블록 일관성 위해 유지)
 
 def _nearest_spd_correlation(C: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     C = 0.5 * (C + C.T)
@@ -292,8 +225,7 @@ def _generate_market_params_reasonable(d: int, k: int, r: float, dev, seed: int 
         'cholesky_L': cholesky_L
     }
 
-# 파라미터 생성 실행 (기본: 기존 버전 사용; 필요시 reasonable 버전으로 교체)
-#params = _generate_market_params(d, k, r, device, seed)
+# 파라미터 생성 실행
 params = _generate_market_params_reasonable(d, k, r, device, seed)  # << 필요시 이 줄로 교체
 
 # 자주 사용하는 파라미터를 전역 변수로 추출
