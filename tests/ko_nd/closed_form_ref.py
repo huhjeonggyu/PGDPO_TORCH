@@ -1,6 +1,5 @@
 # closed_form_ref.py
-# 역할: 다차원 Riccati ODE를 풀어 분석적 벤치마크 해를 계산 (ver2 형식)
-# 제공해주신 analytical_solver.py의 로직을 ver2 프레임워크에 맞게 재구성했습니다.
+# 역할: 다차원 Riccati ODE를 풀어 분석적 벤치마크 해를 계산 (utility-scaled u^2 패널티, full 버전)
 
 import numpy as np
 import torch
@@ -10,191 +9,166 @@ from scipy.integrate import solve_ivp
 __all__ = ["precompute_ABC", "ClosedFormPolicy"]
 
 # ==============================================================================
-# ===== 1. Riccati ODE 시스템 정의 (Helper Functions) =====
+# ===== 1. Riccati ODE 시스템 정의 =====
 # ==============================================================================
 
 def _flatten_C_B(C, B):
-    """행렬 C(k,k)와 벡터 B(k,)를 1차원 배열 z(k²+k,)로 변환합니다."""
     return np.concatenate([C.ravel(), B])
 
 def _unflatten_C_B(z, k):
-    """1차원 배열 z를 행렬 C와 벡터 B로 복원합니다."""
     C = z[:k * k].reshape((k, k))
     B = z[k * k:]
     return C, B
 
-def _compute_beta_matrices(alpha, sigma, Sigma_inv, rho_Y):
+def _compute_beta_matrices(alpha, sigma, Sigma_reg_inv, rho_Y):
     """
-    β₀, β₁, β₂ 행렬을 계산합니다.
+    beta0 = (σA)^T Γ (σA)
+    beta1 = (σA)^T Γ (σρ)      # 이후 σ_Y와 곱해져 (σA)^T Γ M C 항으로 사용
+    beta2 = (σρ)^T Γ (σρ)      # 이후 σ_Y와 곱해져 C M^T Γ M C 항으로 사용
     """
     sigma_diag = np.diag(sigma)
-    sigmaA = sigma_diag @ alpha
-    sigma_rho = sigma_diag @ rho_Y
+    sigmaA = sigma_diag @ alpha          # (n x k) = diag(σ) A
+    sigma_rho = sigma_diag @ rho_Y       # (n x r) = diag(σ) ρ_Y
 
-    beta0 = sigmaA.T @ Sigma_inv @ sigmaA
-    beta1 = sigmaA.T @ Sigma_inv @ sigma_rho
-    beta2 = sigma_rho.T @ Sigma_inv @ sigma_rho
+    beta0 = sigmaA.T @ Sigma_reg_inv @ sigmaA
+    beta1 = sigmaA.T @ Sigma_reg_inv @ sigma_rho
+    beta2 = sigma_rho.T @ Sigma_reg_inv @ sigma_rho
     return beta0, beta1, beta2
 
-def _ode_multifactor_ABC_backward(t, z, k, gamma, kappa_Y, sigma_Y, Phi_Y, theta_Y, betas):
+def _ode_multifactor_ABC_backward(t, z, k, kappa_Y, sigma_Y, Phi_Y, theta_Y, betas):
     """
-    Riccati ODE 시스템을 정의합니다. scipy.solve_ivp가 호출할 함수입니다.
+    Backward(terminal→initial) 적분을 위해 반환값에 음수를 붙여 solve_ivp를 [0,T] 전방 적분으로 변환.
+    -dot C = C Q_z C + (kappa^T C + C kappa) + (σA + M C)^T Γ (σA + M C)
+    -dot B = kappa^T B + C Q_z θ + (σA + M C)^T Γ M B
     """
     C, B = _unflatten_C_B(z, k)
     beta0, beta1, beta2 = betas
-    factor = (1.0 - gamma) / gamma
 
-    # dC/dt 방정식
-    dC = (
-        kappa_Y.T @ C + C @ kappa_Y
-        - C @ sigma_Y @ Phi_Y @ sigma_Y.T @ C
-        - factor * (
-            beta0
-            + beta1 @ sigma_Y @ C
-            + C @ sigma_Y.T @ beta1.T
-            + C @ sigma_Y.T @ beta2 @ sigma_Y @ C
-        )
+    # Q_z = σ_Y Φ_Y σ_Y^T  (k x k)
+    Qz = sigma_Y @ Phi_Y @ sigma_Y.T
+
+    # (σA + M C)^T Γ (σA + M C) 전개 항
+    #  = beta0 + beta1 σ_Y C + C σ_Y^T beta1^T + C σ_Y^T beta2 σ_Y C
+    cross_quad = (
+        beta0
+        + beta1 @ sigma_Y @ C
+        + C @ sigma_Y.T @ beta1.T
+        + C @ sigma_Y.T @ beta2 @ sigma_Y @ C
     )
 
-    # dB/dt 방정식
-    dB = (
-        kappa_Y.T @ B
-        - C @ sigma_Y @ Phi_Y @ sigma_Y.T @ B
-        - factor * (
-            C @ sigma_Y.T @ beta2 @ sigma_Y @ B
-            + beta1 @ sigma_Y @ B
-        )
-    )
-    if theta_Y is not None:
-        dB -= C @ kappa_Y @ theta_Y # 부호 및 전치 수정
+    # dC_raw = C Qz C + (kappa^T C + C kappa) + cross_quad
+    dC = (C @ Qz @ C) + (kappa_Y.T @ C + C @ kappa_Y) + cross_quad
 
-    # solve_ivp는 순방향 적분기이므로, 역방향 ODE를 위해 -를 붙여 반환
+    # dB_raw = kappa^T B + C Qz θ + [(σA + M C)^T Γ M] B
+    #        = kappa^T B + C Qz θ + (beta1 σ_Y + C σ_Y^T beta2 σ_Y) B
+    dB = (kappa_Y.T @ B) + (C @ Qz @ theta_Y) + (beta1 @ sigma_Y @ B) + (C @ sigma_Y.T @ beta2 @ sigma_Y @ B)
+
+    # Backward integration trick: return negative to integrate from T→0 with t_span=[0,T]
     return -_flatten_C_B(dC, dB)
 
-
 # ==============================================================================
-# ===== 2. ODE 솔버 실행 (Main API) =====
+# ===== 2. ODE 솔버 실행 =====
 # ==============================================================================
 
-def precompute_ABC(params: dict, T: float, gamma: float):
+def precompute_ABC(params: dict, T: float, gamma: float, epsilon: float = 1e-3):
     """
-    scipy.integrate.solve_ivp를 사용하여 다차원 Riccati ODE를 수치적으로 풉니다.
-    기존 precompute_BC를 대체하며, 행렬 A, B, C 중 B와 C를 계산합니다.
-
-    Args:
-        params (dict): user_pgdpo_base.py에서 생성된 모든 시장 파라미터 딕셔너리.
-        T (float): 만기.
-        gamma (float): 위험 회피 계수.
-
-    Returns:
-        scipy.integrate.OdeSolution: ODE의 해를 담고 있는 솔루션 객체.
+    Utility-scaled quadratic penalty를 반영한 Riccati ODE 해를 풉니다.
+    Γ = (γ·Σ + ε·I)^{-1} 를 상수로 사용합니다.  # [FIX] docstring 업데이트
     """
-    # NumPy 배열로 변환 (scipy는 NumPy 기반)
     k = params['kappa_Y'].shape[0]
     kappa_Y = params['kappa_Y'].cpu().numpy()
     sigma_Y = params['sigma_Y'].cpu().numpy()
-    Phi_Y = params['Phi_Y'].cpu().numpy()
-    alpha = params['alpha'].cpu().numpy()
-    sigma = params['sigma'].cpu().numpy()
-    rho_Y = params['rho_Y'].cpu().numpy()
+    Phi_Y   = params['Phi_Y'].cpu().numpy()
+    alpha   = params['alpha'].cpu().numpy()    # A (n x k)
+    sigma   = params['sigma'].cpu().numpy()    # σ (n,)
+    rho_Y   = params['rho_Y'].cpu().numpy()    # ρ_Y (r x r) 또는 (r x r_eff)
     theta_Y = params['theta_Y'].cpu().numpy()
-    Sigma = params['Sigma'].cpu().numpy()
-    Sigma_inv = np.linalg.inv(Sigma)
+    Sigma   = params['Sigma'].cpu().numpy()    # Σ (n x n)
 
-    # ODE에 필요한 beta 행렬 미리 계산
-    betas = _compute_beta_matrices(alpha, sigma, Sigma_inv, rho_Y)
+    # Γ = (γ Σ + ε I)^{-1}  # [FIX] 그대로 사용 (상수)
+    Sigma_reg = gamma * Sigma + epsilon * np.eye(Sigma.shape[0])
+    Sigma_reg_inv = np.linalg.inv(Sigma_reg)
 
-    # 터미널 조건 (t=T에서 B와 C는 0)
+    betas = _compute_beta_matrices(alpha, sigma, Sigma_reg_inv, rho_Y)
+
     C_T = np.zeros((k, k))
     B_T = np.zeros(k)
     zT = _flatten_C_B(C_T, B_T)
 
-    # ODE 풀이 (t=T에서 시작하여 t=0 방향으로)
     sol = solve_ivp(
         fun=_ode_multifactor_ABC_backward,
-        t_span=[0, T],
-        y0=zT,
+        t_span=[0, T],            # backward를 위해 fun에서 부호 반전
+        y0=zT,                    # terminal condition at T, but with backward trick
         method='Radau',
         dense_output=True,
-        args=(k, gamma, kappa_Y, sigma_Y, Phi_Y, theta_Y, betas),
+        args=(k, kappa_Y, sigma_Y, Phi_Y, theta_Y, betas),
         rtol=1e-6,
         atol=1e-8
-    ) #
-    
-    print("✅ Analytical solver has successfully computed the benchmark solution.")
+    )
+    print("✅ Analytical solver (utility-scaled u^2 penalty) computed the benchmark solution.")
     return sol
 
-
 # ==============================================================================
-# ===== 3. 분석적 정책 모듈 (PyTorch nn.Module) =====
+# ===== 3. 분석적 정책 모듈 =====
 # ==============================================================================
 
 class ClosedFormPolicy(nn.Module):
     """
-    ODE 해로부터 특정 상태(t, Y)에서의 최적 정책을 계산하는 nn.Module.
-    ver2의 일반화된 `states_dict` 입력을 처리합니다.
+    Riccati ODE 해로부터 최적 정책을 계산하는 모듈.
+    Utility-scaled quadratic penalty: Γ = (γ·Σ + ε·I)^{-1}.
     """
-    def __init__(self, ode_solution, params: dict, T: float, gamma: float, u_cap: float):
+    def __init__(self, ode_solution, params: dict, T: float, gamma: float, epsilon: float = 1e-3):
         super().__init__()
         self.sol = ode_solution
         self.T = T
         self.gamma = gamma
-        self.u_cap = u_cap
+        self.epsilon = epsilon
 
-        # 필요한 파라미터들을 텐서로 변환하여 버퍼에 등록
-        self.register_buffer("alpha", params['alpha'])
-        self.register_buffer("sigma", params['sigma'])
-        self.register_buffer("Sigma_inv", params['Sigma_inv'])
-        self.register_buffer("rho_Y", params['rho_Y'])
-        self.register_buffer("sigma_Y", params['sigma_Y'])
-        
+        # 파라미터 등록
+        self.register_buffer("alpha",   params['alpha'])     # A (n x k)
+        self.register_buffer("sigma",   params['sigma'])     # σ (n,)
+        self.register_buffer("rho_Y",   params['rho_Y'])     # ρ_Y
+        self.register_buffer("sigma_Y", params['sigma_Y'])   # σ_Y (k x r)
+
         self.d = self.sigma.shape[0]
         self.k = self.alpha.shape[1] if self.alpha.ndim > 1 else 0
 
+        # Γ = (γ Σ + ε I)^{-1}
+        Sigma = params['Sigma']
+        Sigma_reg = gamma * Sigma + epsilon * torch.eye(Sigma.shape[0], device=Sigma.device, dtype=Sigma.dtype)
+        self.register_buffer("Sigma_reg_inv", torch.linalg.inv(Sigma_reg))
+
     def forward(self, **states_dict):
         """
-        주어진 상태 딕셔너리에 대해 최적 제어(u)를 계산합니다.
-
-        Args:
-            **states_dict (dict): 'X', 'TmT', 'Y'를 포함하는 상태 딕셔너리.
-
-        Returns:
-            torch.Tensor: 계산된 최적 제어(u).
+        입력:
+          - TmT: time-to-maturity (tensor), solver의 backward trick과 정합
+          - Y:   factor state z_t (tensor of shape [..., k])
+        출력:
+          - u*:  [..., n]
         """
         TmT = states_dict['TmT']
         Y = states_dict.get('Y')
+        if Y is None:
+            raise ValueError("ClosedFormPolicy requires factor state 'Y' (z_t).")  # [FIX] Y 없이 사용 금지
 
-        if Y is None: # Merton 문제 (Y가 없는 경우)
-            mu_minus_r = self.alpha # user_pgdpo_base에서 이렇게 정의했다고 가정
-            myopic = self.Sigma_inv @ mu_minus_r.unsqueeze(-1)
-            return torch.clamp((1.0 / self.gamma) * myopic.T, -self.u_cap, self.u_cap)
-
-        # 1. 현재 시간에 맞는 B, C 값 추출 (NumPy)
-        #tau = self.T - TmT.cpu().numpy().flatten()
-        #z = self.sol.sol(tau).T # (batch, k*k + k)
+        # backward trick 정합: solver는 0→T로 적분하되, 반환은 T-τ를 의미.
         tau = TmT.detach().cpu().numpy().flatten()
-        # 수치 안전을 위해 [0, self.T]로 잘라줍니다.
         tau = np.clip(tau, 0.0, float(self.T))
-        z = self.sol.sol(tau).T  # (batch, k*k + k)
-        
-        # 2. NumPy 결과를 PyTorch 텐서로 변환
+        z = self.sol.sol(tau).T  # shape: [batch, k^2 + k]
+
         C_flat, B_flat = z[:, :self.k**2], z[:, self.k**2:]
-        C = torch.from_numpy(C_flat).view(-1, self.k, self.k).to(Y.device, dtype=Y.dtype)
-        B = torch.from_numpy(B_flat).view(-1, self.k, 1).to(Y.device, dtype=Y.dtype)
+        C = torch.from_numpy(C_flat).view(-1, self.k, self.k).to(Y.device, dtype=Y.dtype)   # [..., k, k]
+        B = torch.from_numpy(B_flat).view(-1, self.k, 1).to(Y.device, dtype=Y.dtype)       # [..., k, 1]
 
-        # 3. Myopic 수요 계산
-        # (d, k) @ (b, k, 1) -> (b, d, 1)
-        myopic_term = self.alpha @ Y.unsqueeze(-1) 
-        myopic_demand = (self.Sigma_inv @ (self.sigma.unsqueeze(-1) * myopic_term))
-        
-        # 4. Hedging 수요 계산
-        # Sigma_XY = diag(sigma) @ rho_Y @ sigma_Y
-        Sigma_XY = torch.diag(self.sigma) @ self.rho_Y @ self.sigma_Y
-        
-        # (b,k,1) + (b,k,k) @ (b,k,1) -> (b,k,1)
-        hedging_inner = B + C @ Y.unsqueeze(-1)
-        hedging_demand = self.Sigma_inv @ (Sigma_XY @ hedging_inner)
+        # myopic: σ A z
+        myopic_term = self.alpha @ Y.unsqueeze(-1)                                         # [..., n, 1] if alpha is (n x k)
+        myopic_vec  = torch.diag(self.sigma) @ myopic_term                                 # diag(σ) (A z)
 
-        # 5. 최종 정책 계산
-        u = (1.0 / self.gamma) * (myopic_demand + hedging_demand).squeeze(-1)
-        return torch.clamp(u, -self.u_cap, self.u_cap)
+        # hedging: M (b + C z), M = diag(σ) ρ_Y σ_Y
+        Sigma_XY = torch.diag(self.sigma) @ self.rho_Y @ self.sigma_Y                      # (n x k) if σ_Y: (k x r)
+        hedging_inner = B + C @ Y.unsqueeze(-1)                                            # [..., k, 1]
+        hedging_vec   = Sigma_XY @ hedging_inner                                           # [..., n, 1]
+
+        # u* = Γ [ σ A z + M (b + C z) ]  # [FIX] 1/γ 스케일 제거
+        u_star = (self.Sigma_reg_inv @ (myopic_vec + hedging_vec)).squeeze(-1)
+        return u_star
