@@ -23,6 +23,7 @@ def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     pR = JX[:, 2::3] # R에 대한 Co-state
     
     # 논문의 PMP 공식: u* = (S/B) * (pS - pR)
-    u = (S * (pS - pR)) / B_cost.view(1, -1)
+    #u = (S * (pS - pR)) / B_cost.view(1, -1)
+    u = (S * (pR - pS)) / B_cost.view(1, -1)
     
     return torch.clamp(u, 0.0, u_cap)
