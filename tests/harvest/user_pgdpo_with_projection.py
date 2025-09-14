@@ -1,6 +1,8 @@
 # user_pgdpo_with_projection.py for Harvesting
 import torch
-from pgdpo_base import R_inv, u_cap, price
+from user_pgdpo_base import R_inv, u_cap, price
+
+PP_NEEDS = ("JX",)
 
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     JX = costates["JX"]

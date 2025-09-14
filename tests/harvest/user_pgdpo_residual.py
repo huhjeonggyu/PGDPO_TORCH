@@ -1,6 +1,9 @@
-# user_pgdpo_residual.py for Harvesting
+# tests/harvest/user_pgdpo_residual.py for Harvesting
 import torch, torch.nn as nn
-from pgdpo_base import R_inv, u_cap, price
+from user_pgdpo_base import R_inv, u_cap, price
+
+# ✨ FIX: 잔차 네트워크의 출력 크기를 조절하는 ResCap 변수 추가
+ResCap = 1.0
 
 class MyopicPolicy(nn.Module):
     def __init__(self): super().__init__()

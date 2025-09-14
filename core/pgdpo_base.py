@@ -58,6 +58,9 @@ def _draw_base_normals(B: int, steps: int, gen: torch.Generator) -> Tuple[torch.
 # -----------------------------------------------------------------------------
 # 공통 실행기
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 공통 실행기
+# -----------------------------------------------------------------------------
 def run_common(
     *,
     train_fn: Callable[..., nn.Module],
@@ -72,25 +75,41 @@ def run_common(
 
     policy = train_fn(**train_kwargs)
 
-    cf_policy = None
+    # ✨ 최종 수정: '진짜' 해석적 해만 담을 변수
+    policy_for_comparison = None
+
     try:
         upb = importlib.import_module("user_pgdpo_base")
         if hasattr(upb, "build_closed_form_policy") and callable(upb.build_closed_form_policy):
             res = upb.build_closed_form_policy()
-            cf_policy = (res[0] if isinstance(res, tuple) else res).to(device)
-            print("✅ Closed-form policy loaded via build_closed_form_policy()")
-    except Exception as e:
-        print(f"[WARN] build_closed_form_policy() failed: {e}")
+            if res and res[0] is not None:
+                policy_obj, meta = res if isinstance(res, tuple) and len(res) > 1 else (res, None)
+                
+                # 메타데이터를 확인하여 진짜 해석적 해인지 판별
+                is_true_cf = not (isinstance(meta, dict) and "no true closed-form" in meta.get("note", ""))
+                
+                if is_true_cf:
+                    # 진짜 해석적 해일 경우에만 변수에 할당
+                    policy_for_comparison = policy_obj.to(device)
+                    print("✅ True closed-form policy loaded via build_closed_form_policy().")
+                else:
+                    # 참조 정책(myopic 등)일 경우, 비교를 건너뛰도록 None을 유지
+                    print("✅ Reference policy loaded. All comparisons will be skipped.")
 
-    rmse_fn(policy, cf_policy, **rmse_kwargs)
+    except Exception as e:
+        print(f"[WARN] build_closed_form_policy() loading failed: {e}")
+
+    # 평가 함수(rmse_fn)와 궤적 생성 함수 모두에 동일한 변수를 전달합니다.
+    # policy_for_comparison이 None이면, 두 함수 모두 비교 로직을 건너뜁니다.
+    rmse_fn(policy, policy_for_comparison, **rmse_kwargs)
 
     try:
         from core.traj import generate_and_save_trajectories
         saved = generate_and_save_trajectories(
-            policy_learn=policy, 
-            policy_cf=cf_policy, 
+            policy_learn=policy,
+            policy_cf=policy_for_comparison,
             B=PGDPO_TRAJ_B,
-            seed_crn=int(CRN_SEED_EU),  # 'seed=' -> 'seed_crn='으로 수정
+            seed_crn=int(CRN_SEED_EU),
             outdir=rmse_kwargs.get("outdir", None),
         )
         print(f"[traj] saved CRN trajectories to: {saved}")

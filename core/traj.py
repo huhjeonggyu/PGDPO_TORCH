@@ -29,6 +29,8 @@ try: from user_pgdpo_base import ref_signals_fn as _REF_FN
 except Exception: _REF_FN = None
 try: from user_pgdpo_base import R_INFO as _R_INFO
 except Exception: _R_INFO = {}
+try: from user_pgdpo_base import price as harvesting_income
+except ImportError: harvesting_income = None
 
 # --- Schema Logic (변경 없음) ---
 def _try_load_user_schema() -> Optional[Dict[str, Any]]:
@@ -70,20 +72,52 @@ class PPRUNNERPolicy(nn.Module):
     def forward(self, **states_dict):
         if not _HAS_RUNNER: raise RuntimeError("'runner' utilities not available.")
         return ppgdpo_u_run(self.stage1_policy, states_dict, REPEATS_RUN, SUBBATCH_RUN, self.seed)
+        
 class RecordingPolicy(nn.Module):
+    """
+    시뮬레이션 중 상태(X), 제어(U), 그리고 기타 사용자 정의 변수(예: 수익)의
+    궤적을 기록하는 래퍼 클래스입니다.
+    """
     def __init__(self, base_policy: nn.Module):
-        super().__init__(); self.base_policy = base_policy; self.X_frames, self.U_frames = [], []
+        super().__init__()
+        self.base_policy = base_policy
+        self.X_frames, self.U_frames = [], []
+        # ✨ FIX: 수확 수익(harvesting income)을 저장할 리스트를 초기화합니다.
+        self.HarvestingIncome_frames = []
+
     def forward(self, **states_dict):
+        # 상태 및 제어 변수 기록
         self.X_frames.append(states_dict["X"].detach())
         if "Y" in states_dict and states_dict["Y"] is not None:
             if not hasattr(self, 'Y_frames'): self.Y_frames = []
             self.Y_frames.append(states_dict["Y"].detach())
+        
         U = self.base_policy(**states_dict)
-        self.U_frames.append(U.detach()); return U
+        self.U_frames.append(U.detach())
+
+        # ✨ FIX: 순간 수확 수익률을 계산하고 기록합니다.
+        # 이 로직은 'harvesting_income' 변수가 user_pgdpo_base에 있을 때만 실행됩니다.
+        if harvesting_income is not None:
+            X = states_dict["X"].detach()
+            # 가격 텐서를 현재 계산 장치(device)로 이동
+            p_device = harvesting_income.to(X.device)
+            # 수확 수익 = sum(u * X * price)
+            current_income = ((U * X) * p_device.view(1, -1)).sum(dim=1, keepdim=True)
+            self.HarvestingIncome_frames.append(current_income.detach())
+
+        return U
+
     def stacked(self) -> Dict[str, torch.Tensor]:
+        """기록된 모든 궤적 데이터를 시간 축으로 쌓아 딕셔너리로 반환합니다."""
         data = {"X": torch.stack(self.X_frames, 1), "U": torch.stack(self.U_frames, 1)}
         if hasattr(self, 'Y_frames'): data["Y"] = torch.stack(self.Y_frames, 1)
+        
+        # ✨ FIX: 기록된 수확 수익을 결과 딕셔너리에 추가합니다.
+        if self.HarvestingIncome_frames:
+            data["HarvestingIncome"] = torch.stack(self.HarvestingIncome_frames, 1)
+            
         return data
+        
 def _simulate_and_record(policy: nn.Module, B: int, rng: torch.Generator, sync_time: bool = False) -> Dict[str, torch.Tensor]:
     recorder = RecordingPolicy(policy).to(device); init, _ = sample_initial_states(B, rng=rng)
     if sync_time: init['TmT'].fill_(T)
@@ -185,7 +219,7 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
     traj_cf = _simulate_and_record(policy_cf.to(device), B_all, _g(), sync_time=True) if policy_cf else None
     
     traj_pp = None
-    if policy_cf and PGDPO_CURRENT_MODE in ["run", "projection", "residual"]:
+    if PGDPO_CURRENT_MODE in ["run", "projection", "residual"]:
         if PP_MODE == 'direct' and _HAS_DIRECT:
             print("[traj] Generating 'pp' trajectories using DIRECT method.")
             traj_pp = _simulate_and_record(PPDirectPolicy(policy_learn.to(device), seed_crn), B_all, _g(), sync_time=True)

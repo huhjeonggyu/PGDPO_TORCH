@@ -1,6 +1,8 @@
 # user_pgdpo_residual.py for SIR
 import torch, torch.nn as nn
-from pgdpo_base import u_cap, B_cost
+from user_pgdpo_base import u_cap, B_cost
+
+ResCap = 1.0
 
 class MyopicPolicy(nn.Module):
     def __init__(self): super().__init__()

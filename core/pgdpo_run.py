@@ -87,13 +87,17 @@ def print_policy_rmse_and_samples_run(
     prefix: str = "run",
     needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> None:
-    # ... (u_learn, u_pp_run, u_cf 계산까지는 동일)
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
     u_learn = pol_s1(**states_dict)
     u_pp_run = None
     if enable_pp:
-        B = next(iter(states_dict.values())).size(0)
+        # Check if any states exist to get the batch size
+        valid_states = [v for v in states_dict.values() if v is not None]
+        if not valid_states:
+            raise ValueError("Cannot determine batch size because all states are None.")
+        B = valid_states[0].size(0)
+
         divisors = _divisors_desc(B)
         start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
         u_pp_run = torch.empty_like(u_learn)
@@ -102,7 +106,8 @@ def print_policy_rmse_and_samples_run(
             try:
                 for s in range(0, B, cur_tile):
                     e = min(B, s + cur_tile)
-                    tile_states = {k: v[s:e] for k, v in states_dict.items()}
+                    # ✨ FIX: Add 'if v is not None' to handle cases like sir model's Y state.
+                    tile_states = {k: v[s:e] for k, v in states_dict.items() if v is not None}
                     u_pp_run[s:e] = ppgdpo_u_run(pol_s1, tile_states, repeats, sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
                 break
             except RuntimeError as e:
@@ -131,9 +136,13 @@ def print_policy_rmse_and_samples_run(
     # 샘플 프리뷰
     if VERBOSE:
         n = min(SAMPLE_PREVIEW_N, u_learn.size(0))
+        print("\n--- Sample Previews ---")
         for i in range(n):
             parts, vec = [], False
+            # ✨ FIX: Add a check for None values here as well for printing.
             for k_, v in states_dict.items():
+                if v is None:
+                    continue
                 ts = v[i]
                 if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
                 else: parts.append(f"{k_}={ts.item():.3f}")
@@ -152,7 +161,6 @@ def print_policy_rmse_and_samples_run(
     # 그림 저장
     if outdir is not None:
         save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp_run, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png", bins=60, density=True)
-        # ✨ save_pairwise_scatters 대신 save_combined_scatter 호출
         if u_cf is not None:
             save_combined_scatter(
                 u_ref=u_cf, u_learn=u_learn, u_pp=u_pp_run,

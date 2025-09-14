@@ -176,7 +176,6 @@ def print_policy_rmse_and_samples_direct(
     """
     --projection 모드의 평가 함수 (변수명 오류 수정).
     """
-    # ... (u_learn, u_pp, u_cf 계산까지는 동일)
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
     u_learn = pol_s1(**states_dict)
@@ -227,13 +226,10 @@ def print_policy_rmse_and_samples_direct(
                 outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png"
             )
             
-            # ✨ --- 핵심 수정 부분 --- ✨
-            # u_pp_run -> u_pp 로 변수명 수정
             save_combined_scatter(
                 u_ref=u_cf, u_learn=u_learn, u_pp=u_pp,
                 outdir=outdir, coord=0, fname=f"scatter_{prefix}_comparison.png"
             )
-            # ✨ --- 여기까지 수정 --- ✨
 
     else:
         print("[INFO] No closed-form policy provided for comparison.")
@@ -243,18 +239,20 @@ def print_policy_rmse_and_samples_direct(
         print("\n--- Sample Previews ---")
         for i in range(n):
             parts, vec = [], False
+            # ✨ FIX: state 딕셔너리의 값이 None인 경우를 처리하여 TypeError 방지
             for k_, v in states_dict.items():
+                if v is None:
+                    continue  # Y가 None인 경우와 같이 값이 없는 상태는 건너뜀
+                
                 ts = v[i]
                 if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
                 else: parts.append(f"{k_}={ts.item():.3f}")
+            
             if vec: parts.append("...")
             sstr = ", ".join(parts)
             u_pp_val_str = f"{u_pp[i,0].item():.4f}" if u_pp is not None else "N/A"
             u_cf_val_str = f"{u_cf[i,0].item():.4f}" if u_cf is not None else "N/A"
             print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp_val_str}, u_cf[0]={u_cf_val_str}, ...)")
-
-
-
 
 # -----------------------------------------------------------------------------
 # 독립 실행 테스트
