@@ -1,0 +1,38 @@
+✅ Running with model: sir
+   Overrides: d=100, epochs=500
+✅ Selected device: cuda:6
+✅ Output dir: /home/huh/general/pgdpo_torch/plots/sir/residual/d100_k0/20250915_153006
+🚀 Mode: Residual Learning
+[residual] using ResidualPolicy over MyopicPolicy (net-only optimization)
+[0001] loss=784.268311
+[0025] loss=778.437073
+[0050] loss=758.880615
+[0075] loss=759.431885
+[0100] loss=802.513550
+[0125] loss=747.164062
+[0150] loss=786.366638
+[0175] loss=786.385742
+[0200] loss=776.887390
+[0225] loss=756.449097
+[0250] loss=778.202087
+[0275] loss=776.397827
+[0300] loss=777.297363
+[0325] loss=741.486694
+[0350] loss=774.389404
+[0375] loss=760.063843
+[0400] loss=764.584106
+[0425] loss=748.920044
+[0450] loss=754.530273
+[0475] loss=743.649658
+[0500] loss=810.449707
+[Eval] OOM; reducing tile -> 50
+[INFO] No closed-form policy provided for comparison.
+
+--- Sample Previews ---
+  (X[0]=1.128, TmT=0.155, ...) -> (u_learn[0]=2.1281, u_pp(run)[0]=0.0446, ...)
+  (X[0]=0.994, TmT=0.431, ...) -> (u_learn[0]=1.9940, u_pp(run)[0]=0.4330, ...)
+  (X[0]=1.088, TmT=0.911, ...) -> (u_learn[0]=2.0875, u_pp(run)[0]=1.9823, ...)
+[traj] Simulating trajectories for 'learn' policy...
+[traj] Generating 'pp' trajectories using RUNNER method.
+[traj] Trajectory data saved to: traj_comparison_data.csv
+[traj] saved CRN trajectories to: /home/huh/general/pgdpo_torch/plots/sir/residual/d100_k0/20250915_153006

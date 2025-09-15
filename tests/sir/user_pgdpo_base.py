@@ -51,7 +51,7 @@ for i in range(N_regions):
 T = 2.0
 m = 50
 X0_range = (0.8, 1.2)
-u_cap = 2.0
+u_cap = 10.0
 lb_X  = 1e-5
 N_eval_states = 100
 CRN_SEED_EU = 12345

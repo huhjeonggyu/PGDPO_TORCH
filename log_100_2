@@ -1,0 +1,59 @@
+✅ Running with model: harvest
+   Overrides: d=100, epochs=1000
+✅ Selected device: cuda:5
+✅ Output dir: /home/huh/general/pgdpo_torch/plots/harvest/residual/d100_k0/20250915_185224
+🚀 Mode: Residual Learning
+[residual] using ResidualPolicy over MyopicPolicy (net-only optimization)
+[0001] loss=-10.412412
+[0025] loss=-21.262638
+[0050] loss=-21.421299
+[0075] loss=-22.003002
+[0100] loss=-22.632658
+[0125] loss=-22.159046
+[0150] loss=-22.354897
+[0175] loss=-22.392376
+[0200] loss=-22.473812
+[0225] loss=-22.391047
+[0250] loss=-21.880390
+[0275] loss=-21.801495
+[0300] loss=-21.389084
+[0325] loss=-22.797405
+[0350] loss=-21.791929
+[0375] loss=-21.019047
+[0400] loss=-22.045002
+[0425] loss=-21.994205
+[0450] loss=-21.593742
+[0475] loss=-22.517815
+[0500] loss=-21.173973
+[0525] loss=-21.711031
+[0550] loss=-21.754524
+[0575] loss=-22.274689
+[0600] loss=-22.088207
+[0625] loss=-21.170979
+[0650] loss=-21.893774
+[0675] loss=-21.398247
+[0700] loss=-22.348759
+[0725] loss=-22.377842
+[0750] loss=-21.825052
+[0775] loss=-22.898830
+[0800] loss=-21.723221
+[0825] loss=-21.128727
+[0850] loss=-22.202496
+[0875] loss=-23.030869
+[0900] loss=-21.773949
+[0925] loss=-21.866959
+[0950] loss=-21.871616
+[0975] loss=-21.668755
+[1000] loss=-22.660908
+✅ Reference policy loaded. All comparisons will be skipped.
+[Eval] OOM; reducing tile -> 50
+[INFO] No closed-form policy provided for comparison.
+
+--- Sample Previews ---
+  (X[0]=0.667, TmT=1.950, ...) -> (u_learn[0]=0.7354, u_pp(run)[0]=0.2740, ...)
+  (X[0]=0.771, TmT=1.364, ...) -> (u_learn[0]=0.8498, u_pp(run)[0]=0.3856, ...)
+  (X[0]=0.920, TmT=0.398, ...) -> (u_learn[0]=1.0143, u_pp(run)[0]=0.7329, ...)
+[traj] Simulating trajectories for 'learn' policy...
+[traj] Generating 'pp' trajectories using RUNNER method.
+[traj] Trajectory data saved to: traj_comparison_data.csv
+[traj] saved CRN trajectories to: /home/huh/general/pgdpo_torch/plots/harvest/residual/d100_k0/20250915_185224
