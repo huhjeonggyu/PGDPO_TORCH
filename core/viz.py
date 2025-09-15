@@ -1,6 +1,7 @@
 # core/viz.py
 # 역할: 결과 시각화/로그 유틸
 # - [수정] u_learn, u_pp, u_cf를 하나의 산점도에 그리는 기능 추가
+# - ✨ [SIR] (S, I) 상태 공간에 대한 정책 히트맵 생성 기능 추가
 
 from __future__ import annotations
 
@@ -15,56 +16,39 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# ✨ [SIR 추가] T (Horizon)를 user_pgdpo_base에서 가져옵니다.
+from pgdpo_base import T
 
 # ------------------------------------------------------------
-# 내부 유틸 (변경 없음)
+# 내부 유틸
 # ------------------------------------------------------------
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
-
 def _as_numpy_1d(x: torch.Tensor | np.ndarray, coord: int = 0) -> np.ndarray:
-    """
-    (B,D) 텐서/배열에서 coord 차원을 1D로 꺼내거나,
-    (B,)인 경우 그대로 반환.
-    """
     if isinstance(x, torch.Tensor):
         x = x.detach().float().cpu()
-        if x.ndim == 1:
-            arr = x.numpy()
-        elif x.ndim == 2:
-            arr = x[:, coord].numpy()
-        else:
-            arr = x.reshape(x.shape[0], -1)[:, coord].numpy()
+        if x.ndim == 1: arr = x.numpy()
+        elif x.ndim == 2: arr = x[:, coord].numpy()
+        else: arr = x.reshape(x.shape[0], -1)[:, coord].numpy()
     else:
         x = np.asarray(x)
-        if x.ndim == 1:
-            arr = x
-        elif x.ndim == 2:
-            arr = x[:, coord]
-        else:
-            arr = x.reshape(x.shape[0], -1)[:, coord]
+        if x.ndim == 1: arr = x
+        elif x.ndim == 2: arr = x[:, coord]
+        else: arr = x.reshape(x.shape[0], -1)[:, coord]
     return arr
 
-
 def _compute_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """
-    R^2 = 1 - SSE/SST
-    SST=0 (상수목표)일 때는 SSE==0이면 1.0, 아니면 0.0 처리.
-    """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
+    y_true, y_pred = np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
     sse = np.sum((y_pred - y_true) ** 2)
-    y_mean = np.mean(y_true)
-    sst = np.sum((y_true - y_mean) ** 2)
+    sst = np.sum((y_true - np.mean(y_true)) ** 2)
     if sst <= 1e-12:
         return 1.0 if sse <= 1e-12 else 0.0
     return 1.0 - (sse / sst)
 
-
 # ------------------------------------------------------------
-# ✨ [업데이트] 통합 산점도 (R^2 주석 포함)
+# 통합 산점도 (R^2 주석 포함)
 # ------------------------------------------------------------
 def save_combined_scatter(
     *,
@@ -77,52 +61,33 @@ def save_combined_scatter(
     xlabel: str = "u_closed-form",
     title: Optional[str] = None,
 ) -> str:
-    """
-    u_learn vs u_ref와 u_pp vs u_ref를 하나의 산점도에 겹쳐 그립니다.
-    각각의 R^2 값을 계산하여 범례(legend)에 함께 표시합니다.
-    """
     _ensure_dir(outdir)
-
     x_ref = _as_numpy_1d(u_ref, coord=coord)
     y_learn = _as_numpy_1d(u_learn, coord=coord)
     
-    fig = plt.figure(figsize=(6.5, 6.5))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
 
-    # u_learn vs u_cf 플롯
     r2_learn = _compute_r2(x_ref, y_learn)
     ax.scatter(x_ref, y_learn, s=15, alpha=0.7, label=f"Learned (R²={r2_learn:.4f})", zorder=2)
 
-    # u_pp vs u_cf 플롯 (u_pp가 있을 경우)
     if u_pp is not None:
         y_pp = _as_numpy_1d(u_pp, coord=coord)
         r2_pp = _compute_r2(x_ref, y_pp)
         ax.scatter(x_ref, y_pp, s=15, alpha=0.7, label=f"P-PGDPO (R²={r2_pp:.4f})", zorder=3)
 
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Policy Output")
-    ax.set_title(title or f"Policy Comparison (dim {coord})")
-
-    # y=x 기준선
-    all_vals_list = [x_ref, y_learn]
-    if u_pp is not None:
-        all_vals_list.append(_as_numpy_1d(u_pp, coord=coord))
-    all_vals = np.concatenate(all_vals_list)
+    all_vals = np.concatenate([x_ref, y_learn] + ([_as_numpy_1d(u_pp, coord=coord)] if u_pp is not None else []))
     lo, hi = np.min(all_vals), np.max(all_vals)
     ax.plot([lo, hi], [lo, hi], 'k--', lw=1.5, label="y=x (Perfect Match)", zorder=4)
 
+    ax.set(xlabel=xlabel, ylabel="Policy Output", title=title or f"Policy Comparison (dim {coord})")
     ax.legend(loc="best")
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-
     out_path = os.path.join(outdir, fname)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
     return out_path
 
-
 # ------------------------------------------------------------
-# 오버레이 히스토그램 (기존과 동일)
+# 오버레이 히스토그램
 # ------------------------------------------------------------
 def save_overlaid_delta_hists(
     *,
@@ -133,57 +98,84 @@ def save_overlaid_delta_hists(
     coord: int = 0,
     fname: str = "delta_overlaid_hist.png",
     bins: int = 60,
-    density: bool = True,
-    include_learn_pp: bool = False,
 ) -> str:
     _ensure_dir(outdir)
     series: list[tuple[str, np.ndarray]] = []
-    def _as1(x):
-        x = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        return x[:, coord] if x.ndim == 2 else x
-
+    
     if u_cf is not None:
-        series.append(("Learned vs Closed-Form", _as1(u_learn) - _as1(u_cf)))
-    if (u_pp is not None) and (u_cf is not None):
-        series.append(("P-PGDPO vs Closed-Form", _as1(u_pp) - _as1(u_cf)))
+        series.append(("Learned vs Ref.", _as_numpy_1d(u_learn, coord) - _as_numpy_1d(u_cf, coord)))
+    if u_pp is not None and u_cf is not None:
+        series.append(("P-PGDPO vs Ref.", _as_numpy_1d(u_pp, coord) - _as_numpy_1d(u_cf, coord)))
 
-    if not series:
-        return ""
+    if not series: return ""
 
-    all_vals = np.concatenate([s[1] for s in series], axis=0)
-    lo, hi = float(np.min(all_vals)), float(np.max(all_vals))
+    all_vals = np.concatenate([s[1] for s in series])
+    lo, hi = np.min(all_vals), np.max(all_vals)
     span = max(hi - lo, 1e-8)
     edges = np.histogram_bin_edges(all_vals, bins=bins, range=(lo - 0.05 * span, hi + 0.05 * span))
 
     fig, ax = plt.subplots(figsize=(7.0, 4.5))
     for label, vals in series:
-        mu, sd = float(np.mean(vals)), float(np.std(vals))
-        ax.hist(vals, bins=edges, density=density, histtype="step", linewidth=1.5, label=f"{label} (μ={mu:.3f}, σ={sd:.3f})")
-
-    ax.axvline(0.0, linestyle="--", linewidth=1.0)
-    ax.set(xlabel="Policy Difference (Delta)", ylabel="Density" if density else "Count", title=f"Overlaid Policy Deltas (dim {coord})")
+        mu, sd = np.mean(vals), np.std(vals)
+        ax.hist(vals, bins=edges, density=True, histtype="step", linewidth=1.5, label=f"{label} (μ={mu:.3f}, σ={sd:.3f})")
+    
+    ax.axvline(0.0, color='gray', linestyle="--", linewidth=1.0)
+    ax.set(xlabel="Policy Difference (Delta)", ylabel="Density", title=f"Overlaid Policy Deltas (dim {coord})")
     ax.legend(loc="best")
     out_path = os.path.join(outdir, fname)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
     return out_path
 
+# ------------------------------------------------------------
+# ✨ [SIR 추가] 정책 히트맵 생성 함수
+# ------------------------------------------------------------
+def save_policy_heatmap(
+    policy: torch.nn.Module,
+    t: float,
+    s_range: tuple = (0.0, 1.5),
+    i_range: tuple = (0.0, 0.5),
+    n_grid: int = 50,
+    outdir: str = "plots",
+    fname: str = "policy_heatmap.png"
+) -> str:
+    """(S, I) 상태 공간에서 정책의 등고선 히트맵을 생성합니다."""
+    _ensure_dir(outdir)
+    s_grid = torch.linspace(s_range[0], s_range[1], n_grid)
+    i_grid = torch.linspace(i_range[0], i_range[1], n_grid)
+    S, I = torch.meshgrid(s_grid, i_grid, indexing='ij')
+
+    S_flat, I_flat = S.reshape(-1, 1), I.reshape(-1, 1)
+    R_flat = torch.zeros_like(S_flat) # R은 0으로 가정
+    
+    # 정책 입력에 맞는 상태 텐서 X를 생성합니다 (지역이 1개라고 가정).
+    X_flat = torch.cat([S_flat, I_flat, R_flat], dim=1).to(next(policy.parameters()).device)
+    TmT_flat = torch.full_like(S_flat, T - t).to(X_flat.device)
+
+    with torch.no_grad():
+        u_flat = policy(X=X_flat, TmT=TmT_flat).sum(dim=1)
+    U = u_flat.reshape(n_grid, n_grid).cpu().numpy()
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    c = ax.contourf(S.numpy(), I.numpy(), U, levels=20, cmap='viridis')
+    ax.set(xlabel="Susceptible Population (S)", ylabel="Infected Population (I)",
+           title=f"Policy u(S, I) at t = {t:.2f}")
+    fig.colorbar(c, ax=ax, label="Control Intensity (u)")
+    
+    out_path = os.path.join(outdir, fname)
+    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+    print(f"[viz] Policy heatmap saved to: {os.path.basename(out_path)}")
+    return out_path
 
 # ------------------------------------------------------------
-# 손실 곡선/CSV, 메트릭 CSV (기존과 동일)
+# 손실 곡선/CSV, 메트릭 CSV
 # ------------------------------------------------------------
 def save_loss_curve(loss_hist: list[float], outdir: str, fname: str = "loss_curve.png") -> str:
     _ensure_dir(outdir)
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     ax.plot(np.arange(1, len(loss_hist) + 1), loss_hist)
-    ax.set(xlabel="epoch", ylabel="loss")
-    fig.tight_layout()
-    out_path = os.path.join(outdir, fname)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+    ax.set(xlabel="Epoch", ylabel="Loss")
+    fig.tight_layout(); out_path = os.path.join(outdir, fname); fig.savefig(out_path, dpi=150); plt.close(fig)
     return out_path
-
 
 def save_loss_csv(loss_hist: list[float], outdir: str, fname: str = "loss_history.csv") -> str:
     _ensure_dir(outdir)
@@ -193,7 +185,6 @@ def save_loss_csv(loss_hist: list[float], outdir: str, fname: str = "loss_histor
         writer.writerow(["epoch", "loss"])
         writer.writerows([[i, float(v)] for i, v in enumerate(loss_hist, 1)])
     return out_path
-
 
 def append_metrics_csv(metrics: Dict[str, Any], outdir: str, fname: str = "metrics.csv") -> str:
     _ensure_dir(outdir)
@@ -209,8 +200,6 @@ def append_metrics_csv(metrics: Dict[str, Any], outdir: str, fname: str = "metri
     new_keys = [k for k in metrics if k not in header]
     header.extend(new_keys)
     
-    # metrics 딕셔너리를 rows의 마지막에 추가하거나 업데이트
-    # (tag가 같으면 업데이트, 없으면 추가하는 로직이 필요할 수 있으나 여기서는 단순 추가)
     new_row = {k: metrics.get(k, "") for k in header}
     rows.append(new_row)
     
@@ -220,8 +209,7 @@ def append_metrics_csv(metrics: Dict[str, Any], outdir: str, fname: str = "metri
         writer.writerows(rows)
     return path
 
-
 __all__ = [
-    "save_combined_scatter", "save_overlaid_delta_hists",
+    "save_combined_scatter", "save_overlaid_delta_hists", "save_policy_heatmap",
     "save_loss_curve", "save_loss_csv", "append_metrics_csv", "_ensure_dir",
 ]

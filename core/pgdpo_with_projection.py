@@ -24,18 +24,16 @@ try:
     )
 except Exception as e:
     raise RuntimeError(
-        "[core] Could not import required symbols from user_pgdpo_base "
-        "(device, N_eval_states, CRN_SEED_EU, sample_initial_states)."
+        f"[core] Could not import required symbols from user_pgdpo_base: {e}"
     ) from e
 
 try:
     from user_pgdpo_with_projection import project_pmp, PP_NEEDS
 except Exception as e:
     raise RuntimeError(
-        "[core] Required user projector 'project_pmp' not found in user_pgdpo_with_projection.py."
+        f"[core] Required user projector 'project_pmp' not found in user_pgdpo_with_projection.py."
     ) from e
 
-# ✨ 표준 시각화 및 유틸리티 import
 from viz import (
     save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
 )
@@ -75,67 +73,81 @@ def estimate_costates(
     seed_eval: Optional[int] = None,
     needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> Dict[str, Optional[torch.Tensor]]:
-    # ... (이 함수 내용은 변경되지 않았으므로 생략합니다)
     assert repeats > 0 and sub_batch > 0
     needs = tuple(needs)
-    B = next(iter(initial_states.values())).size(0)
+    
+    valid_states = [v for v in initial_states.values() if v is not None]
+    if not valid_states: raise RuntimeError("[core] estimate_costates: all states are None.")
+    B = valid_states[0].size(0)
+
     leaf: Dict[str, torch.Tensor] = {}
     for k in ("X", "Y"):
-        if k in initial_states:
+        if k in initial_states and initial_states[k] is not None:
             leaf[k] = initial_states[k].detach().clone().requires_grad_(True)
+            
     if not leaf:
         raise RuntimeError("[core] estimate_costates: no differentiable states found (need X and/or Y).")
+
     TmT_val = initial_states.get("TmT")
     if TmT_val is not None:
         TmT_val = TmT_val.detach().clone()
+
     params = list(policy_net.parameters())
     req_bak = [p.requires_grad for p in params]
-    for p in params:
-        p.requires_grad_(False)
-    sums: Dict[str, Optional[torch.Tensor]] = {"JX": None, "JY": None, "JXX": None, "JXY": None, "JYY": None}
+    for p in params: p.requires_grad_(False)
+    
+    sums: Dict[str, Optional[torch.Tensor]] = {k: None for k in ("JX", "JY", "JXX", "JXY", "JYY")}
     def _acc(name: str, val: Optional[torch.Tensor], weight: int):
         if val is None: return
         if sums[name] is None: sums[name] = val.detach() * weight
-        else: sums[name] = sums[name] + val.detach() * weight
+        else: sums[name] += val.detach() * weight
+
     sim_sig = inspect.signature(simulate_fn)
     accepts_rng = "rng" in sim_sig.parameters
     done = 0
     try:
         while done < repeats:
             rpts = min(sub_batch, repeats - done)
-            batch_states: Dict[str, torch.Tensor] = {k: v.repeat(rpts, 1) for k, v in leaf.items()}
+            batch_states: Dict[str, torch.Tensor] = {k: v.repeat(rpts, *([1]*(v.dim()-1))) for k, v in leaf.items()}
             if TmT_val is not None: batch_states["TmT"] = TmT_val.repeat(rpts, 1)
+
             rng_arg = make_generator((seed_eval or 0) + done) if accepts_rng else None
             with torch.enable_grad():
                 args = [policy_net, B * rpts]
                 kwargs = {"train": True, "initial_states_dict": batch_states, "m_steps": None}
                 if accepts_rng: kwargs["rng"] = rng_arg
                 U = simulate_fn(*args, **kwargs)
+
                 if not U.requires_grad: raise RuntimeError("simulate() returned a tensor without grad.")
                 U = U.view(B * rpts, -1).mean(dim=1).view(rpts, B).mean(dim=0)
+                
                 need_2nd = any(k in needs for k in ("JXX", "JXY", "JYY"))
                 targets = [leaf[k] for k in ("X", "Y") if k in leaf]
                 grads = torch.autograd.grad(U.sum(), tuple(targets), create_graph=need_2nd, retain_graph=need_2nd, allow_unused=True)
                 grad_map: Dict[str, Optional[torch.Tensor]] = {}
+                
                 grad_idx = 0
                 if "X" in leaf: grad_map["JX"] = grads[grad_idx]; grad_idx += 1
                 if "Y" in leaf: grad_map["JY"] = grads[grad_idx] if len(grads) > grad_idx else None
+
                 if need_2nd:
-                    JXX_batch, JXY_batch, JYY_batch = None, None, None
-                    if ("JXX" in needs) and ("X" in leaf) and (grad_map.get("JX") is not None): JXX_batch, = torch.autograd.grad(grad_map["JX"].sum(), leaf["X"], retain_graph=True)
-                    if ("JXY" in needs) and ("Y" in leaf) and (grad_map.get("JX") is not None): JXY_batch, = torch.autograd.grad(grad_map["JX"].sum(), leaf["Y"], retain_graph=True)
-                    if ("JYY" in needs) and ("Y" in leaf) and (grad_map.get("JY") is not None): JYY_batch, = torch.autograd.grad(grad_map["JY"].sum(), leaf["Y"])
-                    if "JXX" in needs: _acc("JXX", JXX_batch, rpts)
-                    if "JXY" in needs: _acc("JXY", JXY_batch, rpts)
-                    if "JYY" in needs: _acc("JYY", JYY_batch, rpts)
+                    if ("JXX" in needs) and ("X" in leaf) and (grad_map.get("JX") is not None):
+                        JXX_batch, = torch.autograd.grad(grad_map["JX"].sum(), leaf["X"], retain_graph=True, allow_unused=True)
+                        _acc("JXX", JXX_batch, rpts)
+                    if ("JXY" in needs) and ("Y" in leaf) and (grad_map.get("JX") is not None):
+                        JXY_batch, = torch.autograd.grad(grad_map["JX"].sum(), leaf["Y"], retain_graph=True, allow_unused=True)
+                        _acc("JXY", JXY_batch, rpts)
+                    if ("JYY" in needs) and ("Y" in leaf) and (grad_map.get("JY") is not None):
+                        JYY_batch, = torch.autograd.grad(grad_map["JY"].sum(), leaf["Y"], allow_unused=True)
+                        _acc("JYY", JYY_batch, rpts)
+
                 if "JX" in needs: _acc("JX", grad_map.get("JX"), rpts)
                 if "JY" in needs: _acc("JY", grad_map.get("JY"), rpts)
             done += rpts
-        invN = 1.0 / repeats
-        return {k: (v * invN if v is not None else None) for k, v in sums.items()}
+            
+        return {k: (v * (1.0 / repeats) if v is not None else None) for k, v in sums.items()}
     finally:
         for p, r in zip(params, req_bak): p.requires_grad_(r)
-
 
 # ---------------------------------------------------------------------
 # Direct projector helper
@@ -159,7 +171,7 @@ def ppgdpo_u_direct(
         return u.detach()
 
 # ---------------------------------------------------------------------
-# Public evaluator (DIRECT) - NameError 버그 수정
+# Public evaluator (DIRECT)
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def print_policy_rmse_and_samples_direct(
@@ -173,15 +185,15 @@ def print_policy_rmse_and_samples_direct(
     tile: int | None = None,
     needs: Iterable[str] = ("JX", "JXX", "JXY"),
 ) -> None:
-    """
-    --projection 모드의 평가 함수 (변수명 오류 수정).
-    """
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
     u_learn = pol_s1(**states_dict)
     u_pp = None
     try:
-        B = next(iter(states_dict.values())).size(0)
+        valid_states = [v for v in states_dict.values() if v is not None]
+        if not valid_states: raise ValueError("Cannot determine batch size because all states are None.")
+        B = valid_states[0].size(0)
+
         divisors = _divisors_desc(B)
         start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
         u_pp_calc = torch.empty_like(u_learn)
@@ -190,7 +202,8 @@ def print_policy_rmse_and_samples_direct(
             try:
                 for s in range(0, B, cur_tile):
                     e = min(B, s + cur_tile)
-                    tile_states = {k: v[s:e] for k, v in states_dict.items()}
+                    # ✨ [수정] v가 None이 아닐 때만 슬라이싱하도록 변경
+                    tile_states = {k: v[s:e] for k, v in states_dict.items() if v is not None}
                     u_pp_calc[s:e] = ppgdpo_u_direct(pol_s1, tile_states, repeats=repeats, sub_batch=sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
                 u_pp = u_pp_calc
                 break
@@ -203,34 +216,22 @@ def print_policy_rmse_and_samples_direct(
     except Exception as e:
         print(f"\n[Eval] ERROR: An unexpected error occurred during PMP projection: {e}")
         u_pp = None
+    
     u_cf = pol_cf(**states_dict) if pol_cf is not None else None
-
-    # ====== RMSE 출력, 샘플 프리뷰, 플롯/메트릭 저장 ======
+    
     prefix = "direct"
     if u_cf is not None:
         rmse_learn = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
         print(f"\n[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
-        
         if u_pp is not None:
             rmse_pp = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
             print(f"[Policy RMSE-PP({prefix})] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp:.6f}")
-        
         if outdir is not None:
             metrics = {f"rmse_learn_cf_{prefix}": rmse_learn}
-            if u_pp is not None:
-                metrics[f"rmse_pp_cf_{prefix}"] = rmse_pp
+            if u_pp is not None: metrics[f"rmse_pp_cf_{prefix}"] = rmse_pp
             append_metrics_csv(metrics, outdir)
-            
-            save_overlaid_delta_hists(
-                u_learn=u_learn, u_pp=u_pp, u_cf=u_cf,
-                outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png"
-            )
-            
-            save_combined_scatter(
-                u_ref=u_cf, u_learn=u_learn, u_pp=u_pp,
-                outdir=outdir, coord=0, fname=f"scatter_{prefix}_comparison.png"
-            )
-
+            save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png")
+            save_combined_scatter(u_ref=u_cf, u_learn=u_learn, u_pp=u_pp, outdir=outdir, coord=0, fname=f"scatter_{prefix}_comparison.png")
     else:
         print("[INFO] No closed-form policy provided for comparison.")
 
@@ -239,24 +240,17 @@ def print_policy_rmse_and_samples_direct(
         print("\n--- Sample Previews ---")
         for i in range(n):
             parts, vec = [], False
-            # ✨ FIX: state 딕셔너리의 값이 None인 경우를 처리하여 TypeError 방지
             for k_, v in states_dict.items():
-                if v is None:
-                    continue  # Y가 None인 경우와 같이 값이 없는 상태는 건너뜀
-                
+                if v is None: continue
                 ts = v[i]
                 if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
                 else: parts.append(f"{k_}={ts.item():.3f}")
-            
             if vec: parts.append("...")
             sstr = ", ".join(parts)
             u_pp_val_str = f"{u_pp[i,0].item():.4f}" if u_pp is not None else "N/A"
             u_cf_val_str = f"{u_cf[i,0].item():.4f}" if u_cf is not None else "N/A"
             print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp_val_str}, u_cf[0]={u_cf_val_str}, ...)")
 
-# -----------------------------------------------------------------------------
-# 독립 실행 테스트
-# -----------------------------------------------------------------------------
 def main():
     from pgdpo_base import run_common, train_stage1_base
     run_common(

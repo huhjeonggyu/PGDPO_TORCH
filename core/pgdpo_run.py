@@ -160,7 +160,8 @@ def print_policy_rmse_and_samples_run(
 
     # 그림 저장
     if outdir is not None:
-        save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp_run, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png", bins=60, density=True)
+        # ✨ [수정] density=True 인자 제거
+        save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp_run, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png", bins=60)
         if u_cf is not None:
             save_combined_scatter(
                 u_ref=u_cf, u_learn=u_learn, u_pp=u_pp_run,

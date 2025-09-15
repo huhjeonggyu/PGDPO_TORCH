@@ -1,6 +1,7 @@
 # core/traj.py — schema-driven, multi-domain trajectory visualization
 # - [업데이트] cf, pp, learn 정책 궤적을 하나의 그래프에 통합하여 출력
 # - ✨ [추가] 시각화에 사용된 모든 궤적 데이터를 CSV 파일로 저장하는 기능
+# - ✨ [SIR] R_t, Co-state 기록 및 SIR 전용 커스텀 플롯 모드 추가
 
 from __future__ import annotations
 import os, json, time, csv
@@ -22,17 +23,23 @@ PP_MODE = os.getenv('PP_MODE','runner').lower()
 _HAS_RUNNER, _HAS_DIRECT = False, False
 try: from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
 except ImportError: pass
-try: from pgdpo_with_projection import ppgdpo_u_direct, REPEATS as REPEATS_DIR, SUBBATCH as SUBBATCH_DIR; _HAS_DIRECT = True
-except ImportError: pass
+try: from pgdpo_with_projection import ppgdpo_u_direct, REPEATS as REPEATS_DIR, SUBBATCH as SUBBATCH_DIR, estimate_costates, PP_NEEDS; _HAS_DIRECT = True
+except ImportError: estimate_costates, PP_NEEDS = None, ()
 
+
+# --- User-defined functions ---
 try: from user_pgdpo_base import ref_signals_fn as _REF_FN
 except Exception: _REF_FN = None
 try: from user_pgdpo_base import R_INFO as _R_INFO
 except Exception: _R_INFO = {}
 try: from user_pgdpo_base import price as harvesting_income
 except ImportError: harvesting_income = None
+# ✨ [SIR] Import calculate_rt from user_pgdpo_base if it exists
+try: from user_pgdpo_base import calculate_rt
+except (ImportError, AttributeError): calculate_rt = None
 
-# --- Schema Logic (변경 없음) ---
+
+# --- Schema Logic ---
 def _try_load_user_schema() -> Optional[Dict[str, Any]]:
     try: from user_pgdpo_base import get_traj_schema; return get_traj_schema()
     except (ImportError, AttributeError): pass
@@ -54,7 +61,7 @@ def _load_and_merge_schemas() -> Dict[str, Any]:
         return {"roles": {"X": {"dim": int(DIM_X or 0), "labels": [f"X_{i+1}" for i in range(int(DIM_X or 0))]}, "U": {"dim": int(DIM_U or 0), "labels": [f"u_{i+1}" for i in range(int(DIM_U or 0))]}}, "views": base_views, "sampling": {"Bmax": 5}}
 SCHEMA = _load_and_merge_schemas()
 
-# --- Helper Functions (변경 없음) ---
+# --- Helper Functions ---
 def _ensure_outdir(outdir: Optional[str]) -> str:
     if outdir is None: outdir = os.path.join("plots", "_traj", time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(outdir, exist_ok=True); return outdir
@@ -74,19 +81,16 @@ class PPRUNNERPolicy(nn.Module):
         return ppgdpo_u_run(self.stage1_policy, states_dict, REPEATS_RUN, SUBBATCH_RUN, self.seed)
         
 class RecordingPolicy(nn.Module):
-    """
-    시뮬레이션 중 상태(X), 제어(U), 그리고 기타 사용자 정의 변수(예: 수익)의
-    궤적을 기록하는 래퍼 클래스입니다.
-    """
     def __init__(self, base_policy: nn.Module):
         super().__init__()
         self.base_policy = base_policy
         self.X_frames, self.U_frames = [], []
-        # ✨ FIX: 수확 수익(harvesting income)을 저장할 리스트를 초기화합니다.
         self.HarvestingIncome_frames = []
+        # ✨ [SIR] Initialize lists for Rt and Co-state
+        self.Rt_frames = []
+        self.Costate_I_frames = []
 
     def forward(self, **states_dict):
-        # 상태 및 제어 변수 기록
         self.X_frames.append(states_dict["X"].detach())
         if "Y" in states_dict and states_dict["Y"] is not None:
             if not hasattr(self, 'Y_frames'): self.Y_frames = []
@@ -95,27 +99,41 @@ class RecordingPolicy(nn.Module):
         U = self.base_policy(**states_dict)
         self.U_frames.append(U.detach())
 
-        # ✨ FIX: 순간 수확 수익률을 계산하고 기록합니다.
-        # 이 로직은 'harvesting_income' 변수가 user_pgdpo_base에 있을 때만 실행됩니다.
         if harvesting_income is not None:
             X = states_dict["X"].detach()
-            # 가격 텐서를 현재 계산 장치(device)로 이동
             p_device = harvesting_income.to(X.device)
-            # 수확 수익 = sum(u * X * price)
             current_income = ((U * X) * p_device.view(1, -1)).sum(dim=1, keepdim=True)
             self.HarvestingIncome_frames.append(current_income.detach())
+
+        # ✨ [SIR] Record Rt and Co-state for SIR model
+        if calculate_rt is not None:
+            X = states_dict["X"].detach()
+            S = X[:, 0::3]
+            current_rt = calculate_rt(S).sum(dim=1, keepdim=True)
+            self.Rt_frames.append(current_rt)
+            
+            mode = os.getenv("PGDPO_CURRENT_MODE")
+            if estimate_costates and mode in ["projection", "run", "base"]:
+                try:
+                    with torch.enable_grad():
+                        costates = estimate_costates(simulate, self.base_policy, {k:v.detach().clone().requires_grad_(True) for k,v in states_dict.items() if k in ['X', 'Y']},
+                                                     repeats=16, sub_batch=16, seed_eval=123, needs=PP_NEEDS)
+                    JX = costates.get("JX")
+                    if JX is not None:
+                        pI = JX[:, 1::3].sum(dim=1, keepdim=True)
+                        self.Costate_I_frames.append(pI.detach())
+                except Exception:
+                    pass # Silently fail if costate estimation is not compatible
 
         return U
 
     def stacked(self) -> Dict[str, torch.Tensor]:
-        """기록된 모든 궤적 데이터를 시간 축으로 쌓아 딕셔너리로 반환합니다."""
         data = {"X": torch.stack(self.X_frames, 1), "U": torch.stack(self.U_frames, 1)}
         if hasattr(self, 'Y_frames'): data["Y"] = torch.stack(self.Y_frames, 1)
-        
-        # ✨ FIX: 기록된 수확 수익을 결과 딕셔너리에 추가합니다.
-        if self.HarvestingIncome_frames:
-            data["HarvestingIncome"] = torch.stack(self.HarvestingIncome_frames, 1)
-            
+        if self.HarvestingIncome_frames: data["HarvestingIncome"] = torch.stack(self.HarvestingIncome_frames, 1)
+        # ✨ [SIR] Add recorded Rt and Co-state to the output dictionary
+        if self.Rt_frames: data["Rt"] = torch.stack(self.Rt_frames, 1)
+        if self.Costate_I_frames: data["Costate_I"] = torch.stack(self.Costate_I_frames, 1)
         return data
         
 def _simulate_and_record(policy: nn.Module, B: int, rng: torch.Generator, sync_time: bool = False) -> Dict[str, torch.Tensor]:
@@ -123,13 +141,31 @@ def _simulate_and_record(policy: nn.Module, B: int, rng: torch.Generator, sync_t
     if sync_time: init['TmT'].fill_(T)
     simulate(recorder, B, initial_states_dict=init, m_steps=m, train=False, rng=rng)
     return recorder.stacked()
+
 def _series_for_view(view: Dict[str, Any], traj_np: Dict[str, Any], Bsel: List[int]) -> Tuple[np.ndarray, List[np.ndarray], List[str]]:
-    block_name = view.get("block", "X")
-    if block_name not in traj_np: return None, [], []
-    arr = _to_np(traj_np.get(block_name)); arr_sel, steps = arr[Bsel], arr.shape[1]; x_time = _linspace_time(steps)
-    labels_info = SCHEMA.get("roles", {}).get(block_name, {}).get("labels", []); indices = view.get("indices", [0]); valid_indices = [i for i in indices if i < arr_sel.shape[-1]]
-    mean_series = arr_sel[..., valid_indices].mean(axis=0); series = [mean_series[:, i] for i in range(mean_series.shape[1])]; labels = [labels_info[idx] for idx in valid_indices]
-    return x_time, series, labels
+    block_names = view.get("block", "X")
+    if isinstance(block_names, str): block_names = [block_names]
+    
+    x_time, all_series, all_labels = None, [], []
+
+    for block_name in block_names:
+        if block_name not in traj_np: continue
+        arr = _to_np(traj_np.get(block_name))
+        arr_sel, steps = arr[Bsel], arr.shape[1]
+        if x_time is None: x_time = _linspace_time(steps)
+        
+        labels_info = SCHEMA.get("roles", {}).get(block_name, {}).get("labels", [])
+        indices = view.get("indices", {}).get(block_name, [0]) if isinstance(view.get("indices"), dict) else view.get("indices", [0])
+        valid_indices = [i for i in indices if i < arr_sel.shape[-1]]
+        
+        mean_series = arr_sel[..., valid_indices].mean(axis=0)
+        series = [mean_series[:, i] for i in range(mean_series.shape[1])]
+        labels = [labels_info[idx] for idx in valid_indices]
+        all_series.extend(series)
+        all_labels.extend(labels)
+        
+    return x_time, all_series, all_labels
+
 def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str | None = None) -> Optional[Tuple[np.ndarray, List[np.ndarray], List[str]]]:
     mode = (view.get("mode","") or "").lower()
     if mode == "u_rnorm":
@@ -137,7 +173,7 @@ def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str |
         if "R" in _R_INFO: R = _R_INFO["R"].cpu().numpy(); u_Ru = np.einsum('bti,ij,btj->bt', U, R, U); r_norm_series = np.sqrt(u_Ru).mean(axis=0)
         else:
             alpha = _R_INFO.get("alpha", 0.0)
-            if alpha <= 0: print("[WARN] Alpha for R-norm is not positive or R matrix not found. Norm will be zero."); r_norm_series = np.zeros(U.shape[1])
+            if alpha <= 0: r_norm_series = np.zeros(U.shape[1])
             else: r_norm_series = np.sqrt(alpha) * np.linalg.norm(U, axis=-1).mean(axis=0)
         return x_time, [r_norm_series], [view.get("block", "U")]
     if mode == "tracking_vpp":
@@ -146,53 +182,78 @@ def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str |
             ref_signals = _REF_FN(x_time)
             for key, values in ref_signals.items(): series.append(np.asarray(values).reshape(-1)); labels.append(f"{key}_ref")
         return x_time, series, labels
+    
+    # ✨ [SIR] Custom plotting logic for SIR model
+    if mode == "custom_sir_rt_plot":
+        Rt = _to_np(traj_np.get("Rt"))[Bsel]
+        x_time = _linspace_time(Rt.shape[1])
+        rt_series = Rt.mean(axis=0).flatten()
+        
+        X = _to_np(traj_np.get("X"))[Bsel]
+        i_indices = [i for i in range(1, X.shape[-1], 3)]
+        i_series = X[..., i_indices].sum(axis=-1).mean(axis=0).flatten()
+        return x_time, [rt_series, i_series], ["Effective_Rt", "Total_Infected"]
+
+    if mode == "custom_sir_i_plot":
+        X = _to_np(traj_np.get("X"))[Bsel]
+        x_time = _linspace_time(X.shape[1])
+        i_indices = [i for i in range(1, X.shape[-1], 3)]
+        i_series = X[..., i_indices].sum(axis=-1).mean(axis=0).flatten()
+        return x_time, [i_series], ["Total_Infected"]
+        
     return None
+
 def _series_for_view_wrapper(view, traj_np, Bsel, policy_tag=None):
     if (view.get("name","").lower().startswith("tracking")): view = {**view, "mode": "tracking_vpp"}
     custom_result = _handle_custom_view(view, traj_np, Bsel, policy_tag)
     if custom_result is not None: return custom_result
     return _series_for_view(view, traj_np, Bsel)
 
-# --- ✨ [신규] CSV 저장 헬퍼 함수 ---
 def _save_series_to_csv(x_time, all_views_data, out_path):
-    """
-    모든 뷰의 시계열 데이터 맵을 하나의 CSV 파일로 저장합니다.
-    """
     header = ["Time"]
     all_columns = {}
     for view_name, series_map in all_views_data.items():
         for component, policies in sorted(series_map.items()):
             for policy, data in sorted(policies.items()):
                 col_name = f"{component}_{policy}"
-                if "ref" in component: col_name = component # 참조 신호는 이름 그대로 사용
+                if "ref" in component: col_name = component
                 if col_name not in header: header.append(col_name)
                 all_columns[col_name] = data
 
-    # 데이터를 순서대로 리스트에 담기
     data_rows = [x_time]
     for h in header:
         if h == "Time": continue
-        data_rows.append(all_columns.get(h, [""] * len(x_time))) # 데이터가 없는 경우 빈 문자열
+        data_rows.append(all_columns.get(h, [""] * len(x_time)))
     
-    # 행렬 형태로 변환 (전치)
     rows = np.stack(data_rows, axis=-1)
-
     with open(out_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
     print(f"[traj] Trajectory data saved to: {os.path.basename(out_path)}")
 
-# --- ✨ [업데이트] 통합 라인 플롯 (정책별 고유 색상/스타일 적용) ---
-def _plot_lines(x_time, series_map, title, ylabel, save_path):
-    fig, ax = plt.subplots(figsize=(8.5, 4.5))
+def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = {}):
+    is_dual_axis = view_opts.get("mode") == "dual_axis"
+    fig, ax1 = plt.subplots(figsize=(8.5, 4.5))
+    ax2 = ax1.twinx() if is_dual_axis else None
     POLICY_STYLES = {
-        "cf":    {"color": "royalblue", "ls": "-",  "lw": 2.5, "zorder": 5, "label": "Closed-Form (cf)"},
+        "cf":    {"color": "royalblue", "ls": "-",  "lw": 2.5, "zorder": 5, "label": "Ref/Myopic"},
         "pp":    {"color": "orangered", "ls": "--", "lw": 1.8, "zorder": 4, "label": "P-PGDPO (pp)", "marker": 'o', "ms": 4, "alpha": 0.7},
         "learn": {"color": "forestgreen", "ls": ":",  "lw": 1.8, "zorder": 3, "label": "Learned", "marker": 's', "ms": 4, "alpha": 0.7},
         "ref":   {"color": "gray", "ls": "-.", "lw": 1.5, "zorder": 2}
     }
+    
+    ax_map = {}
+    if is_dual_axis:
+        for component_label in series_map.keys():
+            if "costate" in component_label.lower() or "shadow" in component_label.lower():
+                ax_map[component_label] = ax2
+            else: ax_map[component_label] = ax1
+    else:
+        for component_label in series_map.keys(): ax_map[component_label] = ax1
+
     for component_label, policies in sorted(series_map.items()):
+        ax = ax_map.get(component_label, ax1)
         if "ref" in component_label:
             ref_label = POLICY_STYLES["ref"].get("label", component_label)
             if 'cf' in policies: ax.plot(x_time, policies['cf'], label=ref_label, **POLICY_STYLES["ref"])
@@ -203,11 +264,26 @@ def _plot_lines(x_time, series_map, title, ylabel, save_path):
                 style_props = POLICY_STYLES.get(policy_key, {})
                 full_label = f"{component_label} - {style_props.get('label')}"
                 ax.plot(x_time, data, label=full_label, **{k:v for k,v in style_props.items() if k != 'label'})
-    ax.set(xlabel="Time", ylabel=ylabel, title=title)
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    ax.legend(loc='best', fontsize=9); fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
 
-# --- ✨ [업데이트] Main Trajectory Generation Function ---
+    ax1.set(xlabel="Time", title=title)
+    if is_dual_axis and "ylabels" in view_opts:
+        ax1.set_ylabel(view_opts["ylabels"][0])
+        if ax2: ax2.set_ylabel(view_opts["ylabels"][1])
+    else:
+        ax1.set_ylabel(ylabel)
+
+    if "h_lines" in view_opts:
+        for line in view_opts["h_lines"]:
+            ax1.axhline(y=line["y"], color=line.get("color", "gray"), ls=line.get("ls", "--"), label=line.get("label"))
+    
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = (ax2.get_legend_handles_labels() if ax2 else ([],[]))
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=9)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
 @torch.no_grad()
 def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[nn.Module] = None, outdir: Optional[str] = None, B: Optional[int] = None, seed_crn: Optional[int] = None) -> str:
     outdir = _ensure_outdir(outdir); B_all = int(B or N_eval_states); seed_crn = int(seed_crn or CRN_SEED_EU)
@@ -249,7 +325,9 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
                 series_map[lab][name] = s
         
         if x_time is not None and series_map:
-            _plot_lines(x_time, series_map, f"Trajectory Comparison: {view['name']}", view.get("ylabel","Value"), os.path.join(outdir, f"traj_{view['name']}_comparison.png"))
+            _plot_lines(x_time, series_map, f"Trajectory Comparison: {view['name']}", 
+                        view.get("ylabel","Value"), os.path.join(outdir, f"traj_{view['name']}_comparison.png"),
+                        view_opts=view)
             all_views_data[view['name']] = series_map
                         
     if master_x_time is not None and all_views_data:
