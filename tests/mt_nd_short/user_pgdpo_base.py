@@ -65,75 +65,183 @@ def _nearest_spd_correlation(C: torch.Tensor, eps: float = 1e-6) -> torch.Tensor
     return 0.5 * (C_corr + C_corr.T)
 
 
+def _nearest_spd_correlation(C: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    C = 0.5 * (C + C.T)
+    evals, evecs = torch.linalg.eigh(C)
+    evals = torch.clamp(evals, min=eps)
+    C_spd = (evecs @ torch.diag(evals) @ evecs.T)
+    d = torch.diag(C_spd).clamp_min(eps).sqrt()
+    Dinv = torch.diag(1.0 / d)
+    C_corr = Dinv @ C_spd @ Dinv
+    return 0.5 * (C_corr + C_corr.T)
+
+
 def _generate_mu_sigma_simple(
     d: int,
     dev,
     seed: int | None = None,
     *,
     vol_range=(0.18, 0.28),
-    avg_corr=0.60,               # ↑ 상관을 약간 높여 숏이 잘 생기게
-    jitter=0.08,
-    alpha_range=(0.04, 0.20),
-    short_frac=0.30,             # 헤지 그룹 비율(대략 30%)
-    alpha_hedge_range=(-0.05, 0.02),  # 헤지 그룹의 약/음수 프리미엄
-    enforce_shorts: bool = True, # 최소 한 개 이상 숏 강제
-    target_neg: int = 1,         # 원하는 최소 음수 비중 개수
-    max_tries: int = 8,          # 재시도 횟수
+    avg_corr=0.50,                # 살짝 낮춰 숏 과다 발생 완화
+    jitter=0.06,
+    alpha_range=(0.03, 0.15),     # 리스크 프리미엄 범위를 전반적으로 낮춤
+    short_frac=0.25,              # 약/음수 프리미엄 부여할 비율
+    alpha_hedge_range=(-0.03, 0.02),
+    enforce_shorts: bool = True,
+    target_neg: int = 1,
+    max_tries: int = 6,
+
+    # ===== 합(∑u) 목표: 더 낮고 보수적으로 =====
+    enforce_sum: bool = True,
+    sum_target: float | None = None,
+    sum_range=(0.25, 0.60),       # 총합 25~60% 근처로 맞춤
+
+    # ===== 분산화 파라미터 =====
+    rho_div: float = 0.35,        # u_unc와 양수-단순체 투영 벡터의 블렌딩 정도(0~1)
+    wmax_cap: float = 0.70,       # 한 종목 최대 비중 상한 (절대값 기준)
+
+    # ===== 숏 통제 =====
+    short_mass_frac: float = 0.15,      # 음수 질량 총합 상한(= short_mass ≤ 0.15 * sum_target)
+    short_count_max_frac: float = 0.40, # 숏 종목 최대 비율
+
+    # ===== 공분산 정규화 =====
+    lam_factor: float = 3e-3,     # Σ에 더 강한 릿지 → 가중치 과대/집중 완화
 ):
     if seed is not None:
         torch.manual_seed(seed)
 
+    # (1) Σ 생성
     def _sample_sigma_corr(_avg_corr: float, _jitter: float):
-        # 변동도, 상관
         sigma = torch.empty(d, device=dev).uniform_(*vol_range)
         Psi = torch.full((d, d), float(_avg_corr), device=dev)
         Psi.fill_diagonal_(1.0)
         if _jitter and _jitter > 0:
             N = torch.randn(d, d, device=dev) * _jitter
             Psi = _nearest_spd_correlation(Psi + 0.5 * (N + N.T))
-        # 공분산(릿지 포함)
         Sigma = torch.diag(sigma) @ Psi @ torch.diag(sigma)
-        lam = 1e-3 * Sigma.diag().mean().item()
+        lam = lam_factor * Sigma.diag().mean().item()  # 릿지 강도 ↑
         Sigma = Sigma + lam * torch.eye(d, device=dev)
-        return sigma, Sigma
+        return Sigma
 
-    # 재시도 루프: 숏이 안 나오면 상관/지터를 조금씩 올려가며 재샘플
     _corr, _jit = avg_corr, jitter
+
+    # (2) 재시도 루프: 숏이 너무 없으면 상관/지터 미세 조정
     for _ in range(max_tries):
-        sigma, Sigma = _sample_sigma_corr(_corr, _jit)
+        Sigma = _sample_sigma_corr(_corr, _jit)
         Sigma_inv = torch.linalg.inv(Sigma)
 
-        # 기본 α 샘플
+        # 기본 α (약간 낮은 범위)
         alpha = torch.empty(d, device=dev).uniform_(*alpha_range)
 
-        # 헤지 그룹에 약/음수 α 부여 (셔플)
+        # 일부 자산은 약/음수 프리미엄으로 헤지 성향 부여
         if short_frac > 0:
             m = max(1, int(d * short_frac))
             idx = torch.randperm(d, device=dev)[:m]
             alpha[idx] = torch.empty(m, device=dev).uniform_(*alpha_hedge_range)
 
-        # 무제약 머튼 해
+        # 무제약 해
         u_unc = (1.0 / gamma) * (Sigma_inv @ alpha)
 
         if (not enforce_shorts) or (u_unc < 0).sum().item() >= target_neg:
-            return {
-                "alpha": alpha,
-                "Sigma": Sigma,
-                "Sigma_inv": Sigma_inv,
-                "u_closed_form_unc": u_unc,
-            }
+            break
+        # 숏이 거의 없으면 상관/지터 약간 올려 재시도
+        _corr = min(0.80, _corr + 0.08)
+        _jit  = min(0.12, _jit + 0.02)
 
-        # 실패 시 다음 시도에서 숏이 더 잘 생기도록 상관/지터 소폭 ↑
-        _corr = min(0.90, _corr + 0.10)
-        _jit  = min(0.15, _jit + 0.02)
+    # (3) ∑u를 낮은 목표로 정렬
+    if enforce_sum:
+        if sum_target is None:
+            a, b = map(float, sum_range)
+            S_target = (a + (b - a) * torch.rand((), device=dev)).item()
+        else:
+            S_target = float(sum_target)
+        one = torch.ones(d, device=dev)
+        S_curr = float(u_unc.sum().item())
+        deltaS = S_target - S_curr
+        alpha = alpha + gamma * deltaS * (Sigma @ one) / float(d)
+        u = (1.0 / gamma) * (Sigma_inv @ alpha)  # 갱신
+    else:
+        u = u_unc.clone()
 
-    # 마지막 시도 결과라도 반환
+    # (4) 분산화 블렌딩: 양수-단순체(합=S_target)에 투영한 벡터와 혼합
+    def _proj_simplex(v, mass):
+        # 유클리드 단순체 투영: min||x-v|| s.t. x>=0, 1^T x = mass
+        vpos = v.clamp_min(0.0)
+        s = vpos.sum()
+        if s <= 1e-12:
+            # 모두 0이면 균등 분배
+            return torch.full_like(v, mass / d)
+        # Condat(2016) 방식
+        u_sorted, _ = torch.sort(vpos, descending=True)
+        cssv = torch.cumsum(u_sorted, 0) - mass
+        j = torch.arange(1, d + 1, device=dev, dtype=v.dtype)
+        cond = u_sorted > (cssv / j)
+        if cond.any():
+            rho = int(torch.nonzero(cond, as_tuple=False)[-1].item())
+            theta = cssv[rho] / float(rho + 1)
+        else:
+            theta = cssv[-1] / float(d)
+        return (vpos - theta).clamp_min(0.0)
+
+    S_target_cur = float(u.sum().item())
+    u_pos = _proj_simplex(u, S_target_cur)
+    u = (1.0 - rho_div) * u + rho_div * u_pos  # 집중 완화
+
+    # (5) 숏 질량/개수 제한 → 합 보존하면서 완화
+    neg = (-u).clamp_min(0.0)
+    neg_mass = float(neg.sum().item())
+    cap_mass = float(short_mass_frac * S_target_cur)
+    if neg_mass > cap_mass + 1e-12:
+        s = cap_mass / (neg_mass + 1e-12)
+        # 음수 축소 → 합 증가분만큼 양수에서 비례 감산(합 보존)
+        delta = (1.0 - s) * neg  # 각 좌표별 줄어든 음수량(>0)
+        u[u < 0] = -s * neg[u < 0]
+        pos_idx = (u > 0)
+        pos_mass = float(u[pos_idx].sum().item())
+        if pos_mass > 1e-12:
+            u[pos_idx] -= u[pos_idx] * (delta.sum() / pos_mass)
+
+    # 숏 개수 제한(너무 많으면 작은 음수부터 0으로)
+    max_neg_cnt = int(short_count_max_frac * d)
+    neg_idx = (u < 0).nonzero(as_tuple=False).view(-1)
+    if neg_idx.numel() > max_neg_cnt:
+        # 음수 절대값이 작은 순서로 일부를 0으로
+        vals = u[neg_idx].abs()
+        _, order = torch.sort(vals)  # 오름차순
+        kill = neg_idx[order[:(neg_idx.numel() - max_neg_cnt)]]
+        freed = (-u[kill]).sum()     # 합 증가량
+        u[kill] = 0.0
+        # 합 보존 위해 양수에서 비례 감산
+        pos_idx = (u > 0)
+        pos_mass = float(u[pos_idx].sum().item())
+        if pos_mass > 1e-12:
+            u[pos_idx] -= u[pos_idx] * (freed / pos_mass)
+
+    # (6) 최대 비중 캡(집중 완화) + 재분배(합 보존)
+    if wmax_cap is not None:
+        over = (u > wmax_cap)
+        if over.any():
+            excess = (u[over] - wmax_cap).sum()
+            u[over] = wmax_cap
+            pos_idx = (u > 0) & (~over)
+            pos_mass = float(u[pos_idx].sum().item())
+            if pos_mass > 1e-12:
+                u[pos_idx] -= u[pos_idx] * (excess / pos_mass)
+            else:
+                # 모두 캡에 걸리면 균등 재분배
+                u += excess / d
+
+    # (7) 최종 α 역매핑 (u_target → α = γ Σ u)
+    alpha = gamma * (Sigma @ u)
+    Sigma_inv = torch.linalg.inv(Sigma)
+
     return {
         "alpha": alpha,
         "Sigma": Sigma,
         "Sigma_inv": Sigma_inv,
-        "u_closed_form_unc": u_unc,
+        "u_closed_form_unc": u,  # 이제 이게 무제약 폐형해(변환 후)
     }
+
 
 # (여기 한 줄만 교체)
 params = _generate_mu_sigma_simple(d, device, seed)

@@ -1,91 +1,159 @@
 # tests/mt_nd_short/user_pgdpo_with_projection.py
-# ------------------------------------------------------------
-# Barrier–Newton projector (RUN/PROJECTION 공통 사용)
-# 목적: ∇_u \tilde{H}_bar(u)=0 정지점을 직접 만족 (u_i>0, 합제약 없음)
-# 핵심: c = γ X JX (CRRA 항등식)로 스케일 고정 + 초소형 장벽 eps_bar
-# ------------------------------------------------------------
-import os
 import torch
 from user_pgdpo_base import alpha as ALPHA_CONST, Sigma as SIGMA_CONST, gamma as GAMMA_CONST
 
-# 코어가 추정할 코스테이트
-PP_NEEDS = ("JX", "JXX")  # JXX는 받아오지만 여기선 c 계산에 사용하지 않음
+PP_NEEDS = ("JX", "JXX")  # 코어 추정 키
 
-# 환경 파라미터(원하면 env로 조정)
-EPS_BAR      = float(os.getenv("PGDPO_EPS_BAR", "1e-8"))   # 장벽 세기
-GRAD_TOL     = float(os.getenv("PGDPO_GRAD_TOL", "1e-6"))
-MAX_ITERS    = int(os.getenv("PGDPO_NEWTON_ITERS", "20"))
-TAU_FTB      = float(os.getenv("PGDPO_TAU_FTB", "0.99"))   # fraction-to-boundary
-BETA_BACK    = float(os.getenv("PGDPO_BACKTRACK_BETA", "0.5"))
-ARMIJO_SIGMA = float(os.getenv("PGDPO_ARMIJO_SIGMA", "1e-4"))
+PP_OPTS  = {
+    "L_cap": 1.0,        # 무차입: sum(u) <= 1
+    "eps_bar": 1e-3,     # 장벽 세기 (상황 따라 1e-4 ~ 1e-2)
+    "ridge": 1e-10,      # 뉴턴 선형계 안정화 기본값 (필요시 아래에서 자동 증강)
+    "tau": 0.95,         # fraction-to-the-boundary
+    "armijo": 1e-4,      # Armijo (maximize)
+    "backtrack": 0.5,    # 역추적 배율
+    "max_newton": 30,    # 뉴턴 반복
+    "tol_grad": 1e-8,    # ∥grad∥_∞ 허용오차
+}
 
 @torch.no_grad()
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
-    # ----- 배치 파라미터 -----
-    X = states["X"].view(-1)                     # (B,)
+    X   = states["X"].view(-1, 1)         # (B,1)
+    JX  = costates["JX"].view(-1, 1)      # (B,1)
+    JXX = costates["JXX"].view(-1, 1)     # (B,1)
+    device = X.device
     B = X.shape[0]
 
-    alpha = states.get("alpha", ALPHA_CONST).to(X.device)
-    Sigma = states.get("Sigma", SIGMA_CONST).to(X.device)
-    if alpha.dim() == 1: alpha = alpha.unsqueeze(0).expand(B, -1)       # (B,n)
-    if Sigma.dim() == 2: Sigma = Sigma.unsqueeze(0).expand(B, -1, -1)   # (B,n,n)
-    n = alpha.shape[1]
+    # alpha / Sigma 배치화
+    a_in = states.get("alpha", None)
+    if a_in is None:
+        alpha = ALPHA_CONST.to(device).view(1, -1).expand(B, -1)    # (B,d)
+    else:
+        alpha = (a_in if a_in.dim()==2 else a_in.view(1,-1).expand(B,-1)).to(device)
+    d = alpha.shape[1]
 
-    JX  = costates["JX"].view(-1)                # λ(=V_x) (B,)
-    # JXX = costates["JXX"].view(-1)             # 받긴 받지만 사용 안 함
+    S_in = states.get("Sigma", None)
+    if S_in is None:
+        Sigma = SIGMA_CONST.to(device)                              # (d,d)
+    else:
+        Sigma = (S_in if S_in.dim()==2 else S_in[0]).to(device)     # 공통 Σ
 
-    # ----- CRRA 스케일: c = γ X JX  (해밀토니안 u-곡률) -----
-    gamma_const = float(GAMMA_CONST)
-    c = gamma_const * X * JX
-    c = torch.clamp(c, min=1e-10)                # 수치 안전
+    one = torch.ones(d, device=device)
+    eps_bar = float(PP_OPTS["eps_bar"]); L_cap = float(PP_OPTS["L_cap"])
+    tau = float(PP_OPTS["tau"]); armijo = float(PP_OPTS["armijo"])
+    back = float(PP_OPTS["backtrack"]); ridge_base = float(PP_OPTS["ridge"])
+    max_newton = int(PP_OPTS["max_newton"]); tol_grad = float(PP_OPTS["tol_grad"])
 
-    # ----- 초기값: 무제약 해 → 음수 0으로 잘라 strictly-feasible -----
-    # u_unc = (1/γ) Σ^{-1} α  (배치 선형시스템 풀이)
-    try:
-        rhs   = (1.0 / gamma_const) * alpha                              # (B,n)
-        u_unc = torch.linalg.solve(Sigma, rhs.unsqueeze(-1)).squeeze(-1) # (B,n)
-    except Exception:
-        # 느리지만 안전한 fallback
-        u_unc = (1.0 / gamma_const) * (torch.linalg.inv(Sigma) @ alpha.transpose(1,0)).transpose(1,0)
-    u = torch.clamp(u_unc, min=1e-6)
+    # PMP 계수
+    negJXX = (-JXX).clamp_min(1e-12)            # > 0
+    a = (JX * X) * alpha                         # (B,d)
+    scale = (X * X * negJXX).view(-1)            # (B,)
 
-    # ----- 보조: 장벽 해밀토니안 값 -----
-    def hbar_value(u_):
-        # \tilde{H}_bar(u) = XJX (α·u) - 0.5 c (u^T Σ u) - eps ∑ log u
-        XuJ = X * JX
-        term_lin  = torch.einsum("b,bi,bi->b", XuJ, alpha, u_)
-        Su        = torch.einsum("bij,bj->bi", Sigma, u_)
-        term_quad = 0.5 * c * torch.einsum("bi,bi->b", u_, Su)
-        term_bar  = EPS_BAR * torch.sum(torch.log(torch.clamp(u_, min=1e-12)), dim=1)
-        return term_lin - term_quad - term_bar
+    # 무제약 초기값 (Q + ridge I) u = a
+    u0 = torch.empty(B, d, device=device)
+    I  = torch.eye(d, device=device)
+    for b in range(B):
+        Qb = (scale[b].item()) * Sigma
+        Ab = a[b].unsqueeze(1)                   # (d,1)
+        Qb_reg = Qb + ridge_base * I
+        ub = torch.linalg.solve(Qb_reg, Ab).view(-1)
+        u0[b] = ub
 
-    # ----- 뉴턴 루프 (대각 프리컨디셔너) -----
-    diagS = torch.diagonal(Sigma, dim1=-2, dim2=-1)  # (B,n)
-    for _ in range(MAX_ITERS):
-        XuJ = X * JX
-        Su  = torch.einsum("bij,bj->bi", Sigma, u)
-        grad = XuJ.unsqueeze(1)*alpha - c.unsqueeze(1)*Su + EPS_BAR/torch.clamp(u, min=1e-12)
-        if grad.norm(dim=1).median() < GRAD_TOL:
-            break
+    # 유클리드 단순체(∑<=L) 투영: 견고 버전
+    def proj_simplex_euclid(v, L=1.0):
+        vpos = v.clamp_min(0.0)
+        s = float(vpos.sum().item())
+        if s <= L:
+            return vpos
+        u_sorted = torch.sort(vpos, descending=True).values
+        cssv = torch.cumsum(u_sorted, dim=0) - L
+        j = torch.arange(1, d+1, device=device, dtype=vpos.dtype)
+        cond = u_sorted > (cssv / j)
+        if cond.any():
+            rho_idx = int(torch.nonzero(cond, as_tuple=False)[-1].item())
+            theta = cssv[rho_idx] / float(rho_idx + 1)
+        else:
+            theta = cssv[-1] / float(d)  # fallback
+        return (vpos - theta).clamp_min(0.0)
 
-        # M ≈ c*diag(Σ) + eps/u^2  (좌표별 뉴턴 근사)
-        Mdiag = c.unsqueeze(1)*diagS + EPS_BAR/torch.clamp(u**2, min=1e-12)
-        d = -grad / torch.clamp(Mdiag, min=1e-8)
+    u = torch.stack([proj_simplex_euclid(u0[b], L_cap) for b in range(B)], dim=0)
 
-        # fraction-to-the-boundary
-        tmp   = torch.where(d < 0, -TAU_FTB * u / torch.clamp(d, max=-1e-16), torch.full_like(u, 1e9))
-        amax  = torch.clamp(tmp.min(dim=1).values, max=1.0)
-        a     = torch.where(torch.isfinite(amax), amax, torch.ones_like(amax))
+    # ---- 장벽 부호 수정: 최대화에서는 +eps*log(u) + eps*log(slack) ----
+    def Hbar(uu, b):
+        Qb = scale[b].item() * Sigma
+        val = torch.dot(a[b], uu) - 0.5 * (uu @ Qb @ uu)
+        slack = L_cap - uu.sum()
+        bad = (uu <= 0).any() or (slack <= 0)
+        if bad:
+            return torch.tensor(-float("inf"), device=device, dtype=uu.dtype)
+        val = val + eps_bar * torch.log(uu).sum()
+        val = val + eps_bar * torch.log(slack)
+        return val  # 0-dim Tensor
 
-        # Armijo (maximize)
-        H0 = hbar_value(u)
-        for _ls in range(20):
-            u_new = torch.clamp(u + a.view(-1,1)*d, min=1e-12)
-            H1 = hbar_value(u_new)
-            rhs = H0 + ARMIJO_SIGMA * a * torch.einsum("bi,bi->b", grad, d)
-            if (H1 >= rhs).all():
-                u = u_new
+    def grad_Hbar(uu, b):
+        Qb = scale[b].item() * Sigma
+        slack = L_cap - uu.sum()
+        g = a[b] - (Qb @ uu)
+        g = g + eps_bar * (1.0 / uu)
+        g = g - (eps_bar / slack) * one
+        return g
+
+    def hess_Hbar(uu, b, extra_ridge):
+        Qb = scale[b].item() * Sigma
+        slack = L_cap - uu.sum()
+        # 음정(=concave) 강화: -Q  - eps*diag(1/u^2)  - eps/(slack^2) 11^T  + ridge I
+        H = -Qb
+        H = H - torch.diag(eps_bar / (uu * uu))
+        H = H - (eps_bar / (slack * slack)) * (one.unsqueeze(1) @ one.unsqueeze(0))
+        H = H + extra_ridge * torch.eye(d, device=device)
+        return H
+
+    # 뉴턴-백트래킹 (+자동 ridge 증강 + pinv fallback)
+    for b in range(B):
+        ub = u[b].clone()
+        extra_ridge = ridge_base
+        for _ in range(max_newton):
+            val = Hbar(ub, b)
+            if not torch.isfinite(val):
+                ub = proj_simplex_euclid(u0[b], L_cap)
+                val = Hbar(ub, b)
+            g = grad_Hbar(ub, b)
+            if g.abs().max().item() < tol_grad:
                 break
-            a = a * BETA_BACK
+
+            H = hess_Hbar(ub, b, extra_ridge)
+            try:
+                dlt = torch.linalg.solve(H, -g)
+            except RuntimeError:
+                # 수치 이슈: ridge 증강 → 그래도 안되면 pinv fallback
+                extra_ridge = max(extra_ridge * 10.0, 1e-6)
+                H = hess_Hbar(ub, b, extra_ridge)
+                try:
+                    dlt = torch.linalg.solve(H, -g)
+                except RuntimeError:
+                    dlt = torch.linalg.pinv(H) @ (-g)
+
+            # fraction-to-the-boundary
+            alpha = 1.0
+            neg_idx = (dlt < 0)
+            if neg_idx.any():
+                alpha = min(alpha, float(torch.min(-tau * ub[neg_idx] / dlt[neg_idx]).item()))
+            dsum = float(dlt.sum().item())
+            slack = float((L_cap - ub.sum()).item())
+            if dsum > 0.0:
+                alpha = min(alpha, tau * slack / dsum)
+
+            # Armijo (maximize)
+            f0 = val; gTd = float(g.dot(dlt).item())
+            for _ls in range(20):
+                uc = ub + alpha * dlt
+                if (uc > 0).all() and (uc.sum().item() < L_cap):
+                    f1 = Hbar(uc, b)
+                    if torch.isfinite(f1) and (f1 >= f0 + armijo * alpha * gTd):
+                        ub = uc; val = f1
+                        break
+                alpha *= back
+            else:
+                break
+        u[b] = ub
 
     return u
