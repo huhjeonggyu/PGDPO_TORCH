@@ -6,7 +6,7 @@ PP_NEEDS = ("JX", "JXX")  # 코어 추정 키
 
 PP_OPTS  = {
     "L_cap": 1.0,        # 무차입: sum(u) <= 1
-    "eps_bar": 1e-3,     # 장벽 세기 (상황 따라 1e-4 ~ 1e-2)
+    "eps_bar": 1e-6,     # 장벽 세기 (상황 따라 1e-4 ~ 1e-2)
     "ridge": 1e-10,      # 뉴턴 선형계 안정화 기본값 (필요시 아래에서 자동 증강)
     "tau": 0.95,         # fraction-to-the-boundary
     "armijo": 1e-4,      # Armijo (maximize)

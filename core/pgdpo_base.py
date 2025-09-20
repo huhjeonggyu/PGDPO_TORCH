@@ -212,6 +212,28 @@ def print_policy_rmse_and_samples_base(
     rmse = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
     print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse:.6f}")
 
+    rmse_dim = torch.sqrt(((u_learn - u_cf) ** 2).mean(dim=0))  # (d,)
+    print("[RMSE per-asset] " + ", ".join([f"{i}:{rmse_dim[i].item():.4f}" for i in range(rmse_dim.numel())]))
+    
+    sum_learn = u_learn.sum(dim=1).mean().item()
+    sum_cf    = u_cf.sum(dim=1).mean().item()
+    try:
+        from user_pgdpo_base import L_cap
+        print(f"[sum(u)] learn≈{sum_learn:.3f}, cf≈{sum_cf:.3f} (L_cap={float(L_cap)})")
+    except Exception:
+        print(f"[sum(u)] learn≈{sum_learn:.3f}, cf≈{sum_cf:.3f}")
+    
+    # 샘플 프리뷰에 소비도 같이 찍기 (정확히 같은 states로)
+    if hasattr(pol_s1, "consumption"):
+        C_learn = pol_s1.consumption(**states_dict)  # (B,1)
+    elif hasattr(pol_s1, "base") and hasattr(pol_s1.base, "consumption"):
+        C_learn = pol_s1.base.consumption(**states_dict)
+    else:
+        C_learn = None
+    
+    if C_learn is not None:
+        print(f"[Preview C] mean={C_learn.mean().item():.4f}, min={C_learn.min().item():.4f}, max={C_learn.max().item():.4f}")
+
     if outdir is not None:
         try:
             from viz import save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
@@ -222,7 +244,7 @@ def print_policy_rmse_and_samples_base(
             )
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=None, u_cf=u_cf,
-                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60, density=True,
+                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60,
             )
             append_metrics_csv({"rmse_learn_cf_base": rmse}, outdir)
         except Exception as e:
@@ -279,7 +301,7 @@ def compare_policy_functions(
             )
             save_overlaid_delta_hists(
                 u_learn=u_learn, u_pp=None, u_cf=u_cf,
-                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60, density=True,
+                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60,
             )
             append_metrics_csv({"rmse_learn_cf_base": rmse}, outdir)
         except Exception as e:
