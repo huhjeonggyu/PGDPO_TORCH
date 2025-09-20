@@ -33,6 +33,15 @@ except Exception as e:
 
 PGDPO_TRAJ_B  = int(os.getenv("PGDPO_TRAJ_B", 5))
 
+PREVIEW_COORDS = int(os.getenv("PGDPO_PREVIEW_COORDS", 3))
+
+def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
+    n = mat.size(1)
+    K = min(k, n)
+    parts = [f"{label}[{j}]={mat[i,j].item():.4f}" for j in range(K)]
+    suffix = ", ..." if n > K else ""
+    return ", ".join(parts) + suffix
+
 # -----------------------------------------------------------------------------
 # RNG 유틸
 # -----------------------------------------------------------------------------
@@ -231,7 +240,11 @@ def print_policy_rmse_and_samples_base(
                 parts.append(f"{k_}={ts.item():.3f}")
         if vec: parts.append("...")
         sstr = ", ".join(parts)
-        print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_cf[0]={u_cf[i,0].item():.4f}, ...)")
+        print(
+            f"  ({sstr}) -> ("
+            f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+            f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
+        )
 
 # -----------------------------------------------------------------------------
 # (선택) 간단 비교기 유지

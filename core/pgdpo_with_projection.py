@@ -38,6 +38,15 @@ from viz import (
     save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
 )
 
+PREVIEW_COORDS = int(os.getenv("PGDPO_PREVIEW_COORDS", 3))
+
+def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
+    """행 i에서 앞 k개 좌표를 'label[j]=v' 포맷으로 이어붙임"""
+    n = mat.size(1)
+    K = min(k, n)
+    parts = [f"{label}[{j}]={mat[i,j].item():.4f}" for j in range(K)]
+    return (", ".join(parts)) + (", ..." if n > K else "")
+
 # ---------------------------------------------------------------------
 # Defaults (env-overridable)
 # ---------------------------------------------------------------------
@@ -241,15 +250,39 @@ def print_policy_rmse_and_samples_direct(
         for i in range(n):
             parts, vec = [], False
             for k_, v in states_dict.items():
-                if v is None: continue
+                if v is None:
+                    continue
                 ts = v[i]
-                if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
-                else: parts.append(f"{k_}={ts.item():.3f}")
+                if ts.numel() > 1:
+                    parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
+                else:
+                    parts.append(f"{k_}={ts.item():.3f}")
             if vec: parts.append("...")
             sstr = ", ".join(parts)
-            u_pp_val_str = f"{u_pp[i,0].item():.4f}" if u_pp is not None else "N/A"
-            u_cf_val_str = f"{u_cf[i,0].item():.4f}" if u_cf is not None else "N/A"
-            print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp_val_str}, u_cf[0]={u_cf_val_str}, ...)")
+    
+            # 다좌표 프린트
+            if u_cf is not None and (u_pp is not None):
+                msg = (
+                    f"  ({sstr}) -> ("
+                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
+                )
+            elif u_cf is not None:
+                msg = (
+                    f"  ({sstr}) -> ("
+                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
+                )
+            elif (u_pp is not None):
+                msg = (
+                    f"  ({sstr}) -> ("
+                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS)})"
+                )
+            else:
+                msg = f"  ({sstr}) -> ({_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)})"
+            print(msg)
 
 def main():
     from pgdpo_base import run_common, train_stage1_base

@@ -31,6 +31,16 @@ from viz import (
     save_loss_curve, save_loss_csv
 )
 
+PREVIEW_COORDS = int(os.getenv("PGDPO_PREVIEW_COORDS", 3))
+
+def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
+    """행 i에서 앞 k개 좌표를 'label[j]=v' 형태로 이어붙여 문자열 생성"""
+    n = mat.size(1)
+    K = min(k, n)
+    parts = [f"{label}[{j}]={mat[i,j].item():.4f}" for j in range(K)]
+    suffix = ", ..." if n > K else ""
+    return ", ".join(parts) + suffix
+
 # ------------------------------------------------------------
 # Variance-Reduced 시뮬레이터 (학습/평가 공용): antithetic 평균
 # (이하 simulate_run, estimate_costates_run, ppgdpo_u_run, _divisors_desc 함수는 변경 없음)
@@ -139,28 +149,44 @@ def print_policy_rmse_and_samples_run(
         print("\n--- Sample Previews ---")
         for i in range(n):
             parts, vec = [], False
-            # ✨ FIX: Add a check for None values here as well for printing.
+            # 상태 프리뷰
             for k_, v in states_dict.items():
                 if v is None:
                     continue
                 ts = v[i]
-                if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
-                else: parts.append(f"{k_}={ts.item():.3f}")
+                if ts.numel() > 1:
+                    parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
+                else:
+                    parts.append(f"{k_}={ts.item():.3f}")
             if vec: parts.append("...")
             sstr = ", ".join(parts)
+    
+            # 다좌표 정책 프리뷰
             if u_cf is not None and enable_pp and (u_pp_run is not None):
-                print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp_run[i,0].item():.4f}, u_cf[0]={u_cf[i,0].item():.4f}, ...)")
+                msg = (
+                    f"  ({sstr}) -> ("
+                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords(f'u_pp({prefix})', u_pp_run, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
+                )
             elif u_cf is not None:
-                print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_cf[0]={u_cf[i,0].item():.4f}, ...)")
+                msg = (
+                    f"  ({sstr}) -> ("
+                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
+                )
+            elif enable_pp and (u_pp_run is not None):
+                msg = (
+                    f"  ({sstr}) -> ("
+                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
+                    f"{_fmt_coords(f'u_pp({prefix})', u_pp_run, i, PREVIEW_COORDS)})"
+                )
             else:
-                if enable_pp and (u_pp_run is not None):
-                    print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, u_pp({prefix})[0]={u_pp_run[i,0].item():.4f}, ...)")
-                else:
-                    print(f"  ({sstr}) -> (u_learn[0]={u_learn[i,0].item():.4f}, ...)")
+                msg = f"  ({sstr}) -> ({_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)})"
+            print(msg)
 
     # 그림 저장
     if outdir is not None:
-        # ✨ [수정] density=True 인자 제거
         save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp_run, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png", bins=60)
         if u_cf is not None:
             save_combined_scatter(
