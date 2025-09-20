@@ -51,7 +51,7 @@ def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
 # Defaults (env-overridable)
 # ---------------------------------------------------------------------
 REPEATS  = int(os.getenv("PGDPO_PP_REPEATS", 2560*d))
-SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 256))
+SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 2560))
 VERBOSE            = os.getenv("PGDPO_VERBOSE", "1") == "1"
 SAMPLE_PREVIEW_N   = int(os.getenv("PGDPO_SAMPLE_PREVIEW_N", 3))
 
@@ -196,7 +196,13 @@ def print_policy_rmse_and_samples_direct(
 ) -> None:
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
-    u_learn = pol_s1(**states_dict)
+    
+    # --- (핵심 수정) ---
+    # 1. 전체 정책 출력을 받아 소비 모델 여부 확인 및 분리
+    u_learn_full = pol_s1(**states_dict)
+    is_consumption_model = u_learn_full.size(1) > d
+    u_learn, c_learn = (u_learn_full[:, :d], u_learn_full[:, d:]) if is_consumption_model else (u_learn_full, None)
+    
     u_pp = None
     try:
         valid_states = [v for v in states_dict.values() if v is not None]
@@ -204,14 +210,16 @@ def print_policy_rmse_and_samples_direct(
         B = valid_states[0].size(0)
 
         divisors = _divisors_desc(B)
-        start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
-        u_pp_calc = torch.empty_like(u_learn)
+        start_idx = next((i for i, d_ in enumerate(divisors) if d_ <= (tile or B)), 0)
+        
+        # 2. PMP는 투자(u) 파트만 계산하도록 크기 변경
+        u_pp_calc = torch.empty_like(u_learn) # (B, d) 크기
+        
         for idx in range(start_idx, len(divisors)):
             cur_tile = divisors[idx]
             try:
                 for s in range(0, B, cur_tile):
                     e = min(B, s + cur_tile)
-                    # ✨ [수정] v가 None이 아닐 때만 슬라이싱하도록 변경
                     tile_states = {k: v[s:e] for k, v in states_dict.items() if v is not None}
                     u_pp_calc[s:e] = ppgdpo_u_direct(pol_s1, tile_states, repeats=repeats, sub_batch=sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
                 u_pp = u_pp_calc
@@ -226,18 +234,38 @@ def print_policy_rmse_and_samples_direct(
         print(f"\n[Eval] ERROR: An unexpected error occurred during PMP projection: {e}")
         u_pp = None
     
-    u_cf = pol_cf(**states_dict) if pol_cf is not None else None
+    # 3. 벤치마크 정책도 u와 c로 분리
+    u_cf_full = pol_cf(**states_dict) if pol_cf is not None else None
+    u_cf, c_cf = (None, None)
+    if u_cf_full is not None:
+        u_cf, c_cf = (u_cf_full[:, :d], u_cf_full[:, d:]) if is_consumption_model else (u_cf_full, None)
     
+    # 4. P-PGDPO의 소비(c_pp)는 학습된 정책의 소비(c_learn)를 따름
+    c_pp = c_learn if u_pp is not None else None
+    
+    # 5. RMSE와 샘플 출력을 u와 c에 대해 각각 수행
     prefix = "direct"
     if u_cf is not None:
-        rmse_learn = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-        print(f"\n[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
+        # 투자(u) RMSE
+        rmse_learn_u = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
+        print(f"\n[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_learn_u:.6f}")
+        metrics = {f"rmse_learn_cf_u_{prefix}": rmse_learn_u}
         if u_pp is not None:
-            rmse_pp = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
-            print(f"[Policy RMSE-PP({prefix})] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp:.6f}")
+            rmse_pp_u = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
+            print(f"[Policy RMSE-PP (u)] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp_u:.6f}")
+            metrics[f"rmse_pp_cf_u_{prefix}"] = rmse_pp_u
+
+        # 소비(c) RMSE
+        if is_consumption_model and c_cf is not None:
+            rmse_learn_c = torch.sqrt(((c_learn - c_cf) ** 2).mean()).item()
+            print(f"[Policy RMSE (C)] ||c_learn - c_closed-form||_RMSE: {rmse_learn_c:.6f}")
+            metrics[f"rmse_learn_cf_c_{prefix}"] = rmse_learn_c
+            if c_pp is not None:
+                rmse_pp_c = torch.sqrt(((c_pp - c_cf) ** 2).mean()).item()
+                print(f"[Policy RMSE-PP (C)] ||c_pp({prefix}) - c_closed-form||_RMSE: {rmse_pp_c:.6f}")
+                metrics[f"rmse_pp_cf_c_{prefix}"] = rmse_pp_c
+
         if outdir is not None:
-            metrics = {f"rmse_learn_cf_{prefix}": rmse_learn}
-            if u_pp is not None: metrics[f"rmse_pp_cf_{prefix}"] = rmse_pp
             append_metrics_csv(metrics, outdir)
             save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png")
             save_combined_scatter(u_ref=u_cf, u_learn=u_learn, u_pp=u_pp, outdir=outdir, coord=0, fname=f"scatter_{prefix}_comparison.png")
@@ -250,39 +278,22 @@ def print_policy_rmse_and_samples_direct(
         for i in range(n):
             parts, vec = [], False
             for k_, v in states_dict.items():
-                if v is None:
-                    continue
+                if v is None: continue
                 ts = v[i]
-                if ts.numel() > 1:
-                    parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
-                else:
-                    parts.append(f"{k_}={ts.item():.3f}")
+                if ts.numel() > 1: parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
+                else: parts.append(f"{k_}={ts.item():.3f}")
             if vec: parts.append("...")
             sstr = ", ".join(parts)
     
-            # 다좌표 프린트
-            if u_cf is not None and (u_pp is not None):
-                msg = (
-                    f"  ({sstr}) -> ("
-                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
-                )
-            elif u_cf is not None:
-                msg = (
-                    f"  ({sstr}) -> ("
-                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
-                )
-            elif (u_pp is not None):
-                msg = (
-                    f"  ({sstr}) -> ("
-                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS)})"
-                )
-            else:
-                msg = f"  ({sstr}) -> ({_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)})"
-            print(msg)
+            msg_parts = [f"  ({sstr}) -> ("]
+            msg_parts.append(_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS))
+            if c_learn is not None: msg_parts.append(f", c_learn={c_learn[i].item():.4f}")
+            if u_pp is not None: msg_parts.append(", " + _fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS))
+            if u_cf is not None:
+                msg_parts.append(", " + _fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS))
+                if c_cf is not None: msg_parts.append(f", c_cf={c_cf[i].item():.4f}")
+            msg_parts.append(")")
+            print("".join(msg_parts))
 
 def main():
     from pgdpo_base import run_common, train_stage1_base

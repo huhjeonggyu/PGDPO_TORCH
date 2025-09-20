@@ -38,25 +38,21 @@ C_FRAC = float(os.getenv("PGDPO_C_FRAC", 0.50))
 
 class MyopicPolicy(nn.Module):
     """
-    u_myopic = (1/gamma) * Sigma_inv @ alpha  (머튼 공식)
-      - u>=0, sum(u)<=L_cap 로 투영
-    consumption(state):
-      - 제약 비활성 가정하의 비례소비 C = min{ C_FRAC * X, alpha_rel * X }
+    MyopicPolicy는 이제 투자(u)와 소비(C)를 결합하여 반환합니다.
     """
     def __init__(self):
         super().__init__()
-        # 미리 상수 u_star 계산
-        u_unc = (1.0 / float(GAMMA_CONST)) * (SIGMAi_CONST @ ALPHA_CONST)  # (d,)
+        # u_star 계산 로직은 기존과 동일
+        u_unc = (1.0 / float(GAMMA_CONST)) * (SIGMAi_CONST @ ALPHA_CONST)
         u0 = u_unc.clamp_min(0.0)
         ssum = float(u0.sum().item())
         L_cap = float(L_CAP_CONST)
         d = u0.numel()
 
         if ssum > L_cap:
-            # equality simplex로 투영
             u_sorted = torch.sort(u0, descending=True).values
             cssv = torch.cumsum(u_sorted, dim=0) - L_cap
-            j = torch.arange(1, d+1, device=u0.device, dtype=u0.dtype)
+            j = torch.arange(1, d + 1, device=u0.device, dtype=u0.dtype)
             cond = u_sorted > (cssv / j)
             if cond.any():
                 rho_idx = int(torch.nonzero(cond, as_tuple=False)[-1].item())
@@ -65,23 +61,22 @@ class MyopicPolicy(nn.Module):
                 theta = cssv[-1] / float(d)
             u0 = (u0 - theta).clamp_min(0.0)
 
-        self.register_buffer("u_star", u0.view(-1))  # (d,)
+        self.register_buffer("u_star", u0.view(-1))
 
     @torch.no_grad()
     def forward(self, **states_dict):
-        # 배치 크기에 맞춰 복제
-        X = states_dict.get("X", None)
-        if X is None:
-            return self.u_star.unsqueeze(0)  # (1,d)
-        B = X.shape[0]
-        return self.u_star.unsqueeze(0).expand(B, -1)
+        X = states_dict.get("X")
+        B = X.shape[0] if X is not None else 1
+        
+        # 1. 기준 투자 u_star 생성
+        u = self.u_star.unsqueeze(0).expand(B, -1)
 
-    @torch.no_grad()
-    def consumption(self, **states_dict):
-        # 상대상한 미활성 가정의 비례소비, 단 C <= alpha_rel * X 보장
-        X = states_dict["X"]
+        # 2. 기준 소비 C 계산
         alpha_rel = float(ALPHA_REL_CONST)
         c_frac = float(C_FRAC)
         C_prop = c_frac * X
         C_cap  = alpha_rel * X
-        return torch.minimum(C_prop, C_cap)  # (B,1)
+        C = torch.minimum(C_prop, C_cap)
+
+        # 3. u와 C를 결합하여 (B, d+1) 형태로 반환
+        return torch.cat([u, C], dim=1)

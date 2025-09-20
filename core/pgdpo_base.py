@@ -1,3 +1,5 @@
+# 파일: core/pgdpo_base.py
+
 # core/pgdpo_base.py
 # 공통 러너/헬퍼: 전 모드에서 공통으로 쓰는 유틸과 기본 학습/비교 함수
 
@@ -12,8 +14,10 @@ import torch
 import torch.nn as nn
 import os
 
+# --- (수정) 순환 참조를 유발하던 최상단 import 제거 ---
+
 # -----------------------------------------------------------------------------
-# 사용자 모델 심볼 로드 (tests/<model>/user_pgdpo_base.py가 제공)
+# 사용자 모델 심볼 로드
 # -----------------------------------------------------------------------------
 try:
     from user_pgdpo_base import (
@@ -32,7 +36,6 @@ except Exception as e:
     raise RuntimeError(f"[pgdpo_base] Failed to import symbols from user_pgdpo_base: {e}")
 
 PGDPO_TRAJ_B  = int(os.getenv("PGDPO_TRAJ_B", 5))
-
 PREVIEW_COORDS = int(os.getenv("PGDPO_PREVIEW_COORDS", 3))
 
 def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
@@ -67,9 +70,6 @@ def _draw_base_normals(B: int, steps: int, gen: torch.Generator) -> Tuple[torch.
 # -----------------------------------------------------------------------------
 # 공통 실행기
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# 공통 실행기
-# -----------------------------------------------------------------------------
 def run_common(
     *,
     train_fn: Callable[..., nn.Module],
@@ -83,8 +83,6 @@ def run_common(
     rmse_kwargs = rmse_kwargs or {}
 
     policy = train_fn(**train_kwargs)
-
-    # ✨ 최종 수정: '진짜' 해석적 해만 담을 변수
     policy_for_comparison = None
 
     try:
@@ -93,23 +91,15 @@ def run_common(
             res = upb.build_closed_form_policy()
             if res and res[0] is not None:
                 policy_obj, meta = res if isinstance(res, tuple) and len(res) > 1 else (res, None)
-                
-                # 메타데이터를 확인하여 진짜 해석적 해인지 판별
                 is_true_cf = not (isinstance(meta, dict) and "no true closed-form" in meta.get("note", ""))
-                
                 if is_true_cf:
-                    # 진짜 해석적 해일 경우에만 변수에 할당
                     policy_for_comparison = policy_obj.to(device)
                     print("✅ True closed-form policy loaded via build_closed_form_policy().")
                 else:
-                    # 참조 정책(myopic 등)일 경우, 비교를 건너뛰도록 None을 유지
                     print("✅ Reference policy loaded. All comparisons will be skipped.")
-
     except Exception as e:
         print(f"[WARN] build_closed_form_policy() loading failed: {e}")
 
-    # 평가 함수(rmse_fn)와 궤적 생성 함수 모두에 동일한 변수를 전달합니다.
-    # policy_for_comparison이 None이면, 두 함수 모두 비교 로직을 건너뜁니다.
     rmse_fn(policy, policy_for_comparison, **rmse_kwargs)
 
     try:
@@ -136,45 +126,24 @@ def train_stage1_base(
     seed_train: Optional[int] = None,
     outdir: Optional[str] = None,
 ) -> nn.Module:
-    """
-    기본 시뮬레이터 기반 Stage-1 학습 (분산감소/프로젝션 없음).
-    - seed_local을 직접 넘기지 않고, 초기상태/노이즈를 생성해 simulate(...)에 전달.
-    """
     _epochs = int(epochs_override if epochs_override is not None else epochs)
     _lr = float(lr_override if lr_override is not None else lr)
-
     policy = DirectPolicy().to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=_lr)
-
     loss_hist: list[float] = []
     for ep in range(1, _epochs + 1):
         opt.zero_grad()
-
-        # 재현성 있는 초기상태 + 노이즈
         gen = make_generator((seed_train or 0) + ep)
         states, _ = sample_initial_states(batch_size, rng=gen)
         ZX, ZY = _draw_base_normals(batch_size, m, gen)
-
-        # simulate는 다음 형태를 가정:
-        #   U = simulate(policy, B, initial_states_dict=states, random_draws=(ZX, ZY), m_steps=m)
-        U = simulate(
-            policy,
-            batch_size,
-            initial_states_dict=states,
-            random_draws=(ZX, ZY),
-            m_steps=m,
-        )
-
+        U = simulate(policy, batch_size, initial_states_dict=states, random_draws=(ZX, ZY), m_steps=m)
         loss = -U.mean()
         loss.backward()
         nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         opt.step()
-
         if ep % 25 == 0 or ep == 1:
             print(f"[{ep:04d}] loss={loss.item():.6f}")
         loss_hist.append(float(loss.item()))
-
-    # (옵션) 손실 저장
     if outdir is not None:
         try:
             from viz import save_loss_curve, save_loss_csv
@@ -182,7 +151,6 @@ def train_stage1_base(
             save_loss_curve(loss_hist, outdir, "loss_curve.png")
         except Exception as e:
             print(f"[WARN] base: could not save loss plots: {e}")
-
     return policy
 
 # -----------------------------------------------------------------------------
@@ -193,46 +161,47 @@ def print_policy_rmse_and_samples_base(
     pol_s1: nn.Module,
     pol_cf: Optional[nn.Module],
     *,
-    repeats: int = 0,            # run.py 호환용(미사용)
-    sub_batch: int = 0,          # run.py 호환용(미사용)
+    repeats: int = 0,
+    sub_batch: int = 0,
     seed_eval: Optional[int] = None,
-    tile: Optional[int] = None,  # 호환 인자(미사용)
+    tile: Optional[int] = None,
     outdir: Optional[str] = None,
 ) -> None:
-    gen = make_generator(seed_eval or CRN_SEED_EU)
-    states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
-
-    u_learn = pol_s1(**states_dict)
-
-    if pol_cf is None:
-        print("[INFO] No closed-form policy available; skipping base comparison.")
+    # --- (수정) 필요한 함수들을 함수 내에서 import ---
+    try:
+        from viz import append_metrics_csv, save_combined_scatter
+    except ImportError as e:
+        print(f"[WARN] Could not import visualization functions from viz: {e}")
         return
 
-    u_cf = pol_cf(**states_dict)
-    rmse = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-    print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse:.6f}")
+    gen = make_generator(seed_eval or CRN_SEED_EU)
+    states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
+    u_learn_full = pol_s1(**states_dict)
+    u_cf_full = pol_cf(**states_dict) if pol_cf is not None else None
+    is_consumption_model = u_learn_full.size(1) > d
+    u_learn, c_learn = (u_learn_full[:, :d], u_learn_full[:, d:]) if is_consumption_model else (u_learn_full, None)
+    u_cf, c_cf = (None, None)
+    if u_cf_full is not None:
+        u_cf, c_cf = (u_cf_full[:, :d], u_cf_full[:, d:]) if is_consumption_model else (u_cf_full, None)
 
-    if outdir is not None:
-        try:
-            from viz import save_combined_scatter, save_overlaid_delta_hists, append_metrics_csv
-            save_combined_scatter(
-                u_ref=u_cf, u_learn=u_learn, u_pp=None,  # u_pp=None으로 전달
-                outdir=outdir, coord=0,
-                fname="scatter_base_learn_vs_cf_dim0.png", xlabel="u_cf"
-            )
-            save_overlaid_delta_hists(
-                u_learn=u_learn, u_pp=None, u_cf=u_cf,
-                outdir=outdir, coord=0, fname="delta_base_overlaid_hist.png", bins=60,
-            )
-            append_metrics_csv({"rmse_learn_cf_base": rmse}, outdir)
-        except Exception as e:
-            print(f"[WARN] base: could not save compare plots: {e}")
+    if u_cf is not None:
+        rmse_learn_u = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
+        print(f"[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_learn_u:.6f}")
+        metrics = {"rmse_learn_cf_u_base": rmse_learn_u}
+        if is_consumption_model and c_cf is not None:
+            rmse_learn_c = torch.sqrt(((c_learn - c_cf) ** 2).mean()).item()
+            print(f"[Policy RMSE (C)] ||c_learn - c_closed-form||_RMSE: {rmse_learn_c:.6f}")
+            metrics["rmse_learn_cf_c_base"] = rmse_learn_c
+        if outdir is not None:
+            append_metrics_csv(metrics, outdir)
+    else:
+        print("[INFO] No closed-form policy available; skipping base comparison.")
 
-    # 대표 샘플 3개 출력
-    B = next(iter(states_dict.values())).size(0)
+    B = u_learn.size(0)
     for i in [0, B // 2, B - 1]:
         parts, vec = [], False
         for k_, v in states_dict.items():
+            if v is None: continue
             ts = v[i]
             if ts.numel() > 1:
                 parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
@@ -240,11 +209,30 @@ def print_policy_rmse_and_samples_base(
                 parts.append(f"{k_}={ts.item():.3f}")
         if vec: parts.append("...")
         sstr = ", ".join(parts)
-        print(
-            f"  ({sstr}) -> ("
-            f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-            f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
-        )
+        msg_parts = [f"  ({sstr}) -> ("]
+        msg_parts.append(_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS))
+        if c_learn is not None: msg_parts.append(f", c_learn={c_learn[i].item():.4f}")
+        if u_cf is not None:
+            msg_parts.append(", " + _fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS))
+            if c_cf is not None: msg_parts.append(f", c_cf={c_cf[i].item():.4f}")
+        msg_parts.append(")")
+        print("".join(msg_parts))
+
+    if outdir is not None and u_cf is not None:
+        try:
+            save_combined_scatter(
+                u_ref=u_cf, u_learn=u_learn, u_pp=None,
+                outdir=outdir, coord=0,
+                fname="scatter_base_learn_vs_cf_u_dim0.png", xlabel="u_cf"
+            )
+            if is_consumption_model and c_cf is not None and c_learn is not None:
+                save_combined_scatter(
+                    u_ref=c_cf, u_learn=c_learn, u_pp=None,
+                    outdir=outdir, coord=0,
+                    fname="scatter_base_learn_vs_cf_c.png", xlabel="c_cf", title="Consumption Comparison"
+                )
+        except Exception as e:
+            print(f"[WARN] base: could not save compare plots: {e}")
 
 # -----------------------------------------------------------------------------
 # (선택) 간단 비교기 유지

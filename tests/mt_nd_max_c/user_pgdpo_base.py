@@ -37,7 +37,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 상태/제어 차원
 DIM_X = 1     # wealth X
 DIM_Y = k     # 외생 Y (미사용)
-DIM_U = d     # risky weights
+DIM_U = d + 1 # risky weights
 
 # 평가/난수
 N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100))
@@ -136,26 +136,19 @@ def _proj_simplex_leq(v: torch.Tensor, mass: float) -> torch.Tensor:
 # --------------------------- 정책 ---------------------------
 class DirectPolicy(nn.Module):
     """
-    포트폴리오 + 소비 신경망(합쳐서 하나의 모듈).
-    - forward(**states) -> u (B,d)
-    - consumption(**states) -> C (B,1), C <= alpha_rel * X
+    포트폴리오 + 소비 신경망(하나의 모듈로 통합).
+    - forward(**states)는 u와 C가 결합된 (B, d+1) 텐서를 반환합니다.
     """
     def __init__(self):
         super().__init__()
         state_dim = DIM_X + DIM_Y + 1  # X, (Y), TmT
         hid = 200
 
-        # 투자 네트워크
-        self.net_u = nn.Sequential(
+        # 이제 하나의 네트워크가 투자와 소비 모두에 대한 출력을 생성합니다.
+        self.net = nn.Sequential(
             nn.Linear(state_dim, hid), nn.LeakyReLU(),
             nn.Linear(hid, hid), nn.LeakyReLU(),
-            nn.Linear(hid, DIM_U)
-        )
-        # 소비 네트워크
-        self.net_c = nn.Sequential(
-            nn.Linear(state_dim, hid), nn.LeakyReLU(),
-            nn.Linear(hid, hid), nn.LeakyReLU(),
-            nn.Linear(hid, 1)
+            nn.Linear(hid, DIM_U) # 출력 차원을 d+1로 변경
         )
 
         # 마지막 제약 매핑에 쓰는 softplus beta (부드러움 조절)
@@ -169,45 +162,65 @@ class DirectPolicy(nn.Module):
 
     def forward(self, **states_dict):
         z = self._concat_states(states_dict)
-        # u >= 0
-        u_raw = self.net_u(z)
+        raw_output = self.net(z) # (B, d+1)
+
+        # 1. 투자(u) 파트 분리 및 제약 적용
+        u_raw = raw_output[:, :d] # 앞 d개는 투자
         u_pos = F.softplus(u_raw, beta=self.softplus_beta)
-        # sum(u) <= L_cap
         B = u_pos.size(0)
         u = torch.stack([_proj_simplex_leq(u_pos[b], L_cap) for b in range(B)], dim=0)
-        return u
 
-    @torch.no_grad()
-    def portfolio(self, **states_dict):
-        return self.forward(**states_dict)
-
-    def consumption(self, **states_dict):
-        z = self._concat_states(states_dict)
-        # 상대상한: C = alpha_rel * X * sigmoid(v)
-        v = self.net_c(z)
-        frac = torch.sigmoid(v)          # in (0,1)
+        # 2. 소비(C) 파트 분리 및 제약 적용
+        v = raw_output[:, d:] # 마지막 1개는 소비 로짓
+        frac = torch.sigmoid(v)      # (0,1) 사이 값으로 변환
         X = states_dict["X"]
-        C = alpha_rel * X * frac         # (B,1)
-        return C
+        C = alpha_rel * X * frac     # C <= alpha_rel * X 제약 적용
+
+        # 3. 투자(u)와 소비(C)를 하나의 텐서로 결합하여 반환
+        return torch.cat([u, C], dim=1)
 
 class WrappedCFPolicy(nn.Module):
-    """상수형 기준 정책 u_star를 래핑 (배치에 맞춰 복제)."""
-    def __init__(self, u_star: torch.Tensor):
+    """
+    상수형 기준 투자 정책 u_star와 비례 소비 정책 C를 결합하여 반환합니다.
+    """
+    def __init__(self, u_star: torch.Tensor, alpha_rel: float, c_frac: float):
         super().__init__()
         self.register_buffer("u_star", u_star.view(-1))  # (d,)
+        self.alpha_rel = alpha_rel
+        self.c_frac = c_frac
 
     def forward(self, **states_dict):
         B = states_dict["X"].shape[0]
-        return self.u_star.unsqueeze(0).expand(B, -1)
+        
+        # 1. 투자 u 생성
+        u = self.u_star.unsqueeze(0).expand(B, -1)
+
+        # 2. 소비 C 계산 (MyopicPolicy와 동일한 로직)
+        X = states_dict["X"]
+        C_prop = self.c_frac * X
+        C_cap  = self.alpha_rel * X
+        C = torch.minimum(C_prop, C_cap)
+
+        # 3. u와 C를 (B, d+1) 텐서로 결합하여 반환
+        return torch.cat([u, C], dim=1)
 
 def build_closed_form_policy():
     """
-    평가용 기준 정책 반환.
-    - 비음수/심플렉스 제약까지 반영하려면 u_closed_form_unc를 투영.
+    평가용 기준 정책(벤치마크)을 반환합니다.
+    이제 투자(u)와 소비(C)를 모두 포함합니다.
     """
+    # 1. 기준 투자 포트폴리오 계산
     u0 = u_closed_form_unc.clone()
     u_star = _proj_simplex_leq(u0, L_cap)
-    cf = WrappedCFPolicy(u_star.to(device)).to(device)
+
+    # 2. 기준 소비를 위한 상수 정의
+    # (user_pgdpo_residual.py의 C_FRAC 기본값과 동일하게 설정하여 일관성 유지)
+    C_FRAC_BENCHMARK = 0.50 
+
+    # 3. 수정된 WrappedCFPolicy를 사용하여 정책 객체 생성
+    cf = WrappedCFPolicy(u_star.to(device), alpha_rel, C_FRAC_BENCHMARK).to(device)
+    
+    # meta 정보는 없음 (그대로 None 반환)
     return cf, None
 
 # --------------------------- 초기상태 표본 ---------------------------
@@ -243,44 +256,34 @@ def simulate(
     else:
         states, dt = initial_states_dict, initial_states_dict["TmT"] / float(m_eff)
 
-    # 표준정규 노이즈 (d차원) — 외생 Y 없음
     if random_draws is None:
         Z = torch.randn(B, m_eff, d, device=device, generator=rng)
     else:
         Z = random_draws[0]
 
-    # 로그-형태 적분 (소비 포함)
     logX = states["X"].clamp_min(lb_X).log()
-    TmT0 = states["TmT"]  # (B,1)
+    TmT0 = states["TmT"]
 
-    # 소비 효용 적분
     util_cons = torch.zeros((B, 1), device=device)
 
     for i in range(m_eff):
-        dt_i = dt  # (B,1) — 개별 경로별 동일 간격
-        # 시간(절대): t_i = T - (TmT0 - i*dt)
+        dt_i = dt
         t_i = T - (TmT0 - i * dt_i)
-
         cur_states = {"X": logX.exp(), "TmT": TmT0 - i * dt_i}
-        u = policy(**cur_states)                  # (B,d)
-        # 소비: C <= alpha_rel * X
-        if hasattr(policy, "consumption"):
-            C = policy.consumption(**cur_states)      # (B,1)
-        elif hasattr(policy, "base") and hasattr(policy.base, "consumption"):
-            C = policy.base.consumption(**cur_states) # (B,1) — ResidualPolicy(base)의 소비 위임
-        else:
-            # 폴백: 소비 미정이면 0으로 둠 (제약 미활성 가정에서 잔차 학습용 안전값)
-            C = torch.zeros_like(cur_states["X"])     # (B,1)
 
-        drift = r + torch.einsum("bi,i->b", u, alpha).view(-1,1)  # r + u·alpha
-        var = torch.einsum("bi,ij,bj->b", u, Sigma, u).view(-1,1) # u^T Σ u
-        # dB: u * (Σ^{1/2} dW)
+        # --- (수정된 부분) ---
+        # 정책 호출 한 번으로 u와 C를 모두 받습니다.
+        policy_output = policy(**cur_states)  # (B, d+1)
+        u = policy_output[:, :d]              # 투자 분리
+        C = policy_output[:, d:]              # 소비 분리
+        # --- (여기까지 수정) ---
+
+        drift = r + torch.einsum("bi,i->b", u, alpha).view(-1,1)
+        var = torch.einsum("bi,ij,bj->b", u, Sigma, u).view(-1,1)
         dBX = (torch.einsum("bi,ij->bj", u, chol_S) * Z[:, i, :]).sum(1, keepdim=True)
 
-        # d log X
         logX = logX + (drift - 0.5 * var - C / logX.exp().clamp_min(lb_X)) * dt_i + dBX * dt_i.sqrt()
 
-        # 소비 효용 적분 항 (할인 포함)
         if gamma == 1.0:
             uC = torch.log(C.clamp_min(1e-12))
         else:
@@ -289,7 +292,6 @@ def simulate(
         util_cons = util_cons + disc * uC * dt_i
 
     XT = logX.exp().clamp_min(lb_X)
-    # 유산 효용
     if gamma == 1.0:
         uT = torch.log(XT)
     else:
@@ -297,6 +299,48 @@ def simulate(
     util = util_cons + (kappa * math.exp(-rho * T)) * uT
 
     return util.view(-1)
+
+def get_traj_schema():
+    """
+    mt_nd_max_c 모델의 궤적 시각화 방법을 정의합니다.
+    """
+    # d의 현재 값에 따라 동적으로 라벨 생성
+    u_labels = [f"u_{i+1}" for i in range(d)] + ["Consumption"]
+
+    return {
+        "roles": {
+            "X": {"dim": DIM_X, "labels": ["Wealth"]},
+            # 제어 U의 차원이 d+1이고, 마지막이 소비임을 명시
+            "U": {"dim": DIM_U, "labels": u_labels}, 
+        },
+        "views": [
+            # 시간에 따른 소비 궤적을 그리는 뷰 추가
+            {
+                "name": "Consumption_Path",
+                "block": "U",
+                "mode": "indices",
+                "indices": [d], # d+1개 중 마지막 인덱스(d)가 소비
+                "ylabel": "Consumption (C)"
+            },
+            # 기존의 첫 번째 투자 비중 뷰
+            {
+                "name": "Portfolio_Weight_First_Component",
+                "block": "U",
+                "mode": "indices",
+                "indices": [0],
+                "ylabel": "Portfolio Weight u[0]"
+            },
+            # 자산 뷰
+            {
+                "name": "Wealth_Path",
+                "block": "X",
+                "mode": "indices",
+                "indices": [0],
+                "ylabel": "Wealth (X)"
+            }
+        ],
+        "sampling": {"Bmax": 5}
+    }
 
 # ------------------------------------------------------------
 # 모듈 export

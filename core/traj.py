@@ -1,3 +1,6 @@
+# 파일: core/traj.py
+
+# -*- coding: utf-8 -*-
 # core/traj.py — schema-driven, multi-domain trajectory visualization
 # - [업데이트] cf, pp, learn 정책 궤적을 하나의 그래프에 통합하여 출력
 # - ✨ [추가] 시각화에 사용된 모든 궤적 데이터를 CSV 파일로 저장하는 기능
@@ -14,7 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pgdpo_base import (
-    device, T, m, DIM_X, DIM_U, CRN_SEED_EU, N_eval_states,
+    device, T, m, d, k, DIM_X, DIM_U, CRN_SEED_EU, N_eval_states,
     sample_initial_states, simulate,
 )
 
@@ -34,7 +37,6 @@ try: from user_pgdpo_base import R_INFO as _R_INFO
 except Exception: _R_INFO = {}
 try: from user_pgdpo_base import price as harvesting_income
 except ImportError: harvesting_income = None
-# ✨ [SIR] Import calculate_rt from user_pgdpo_base if it exists
 try: from user_pgdpo_base import calculate_rt
 except (ImportError, AttributeError): calculate_rt = None
 
@@ -67,26 +69,59 @@ def _ensure_outdir(outdir: Optional[str]) -> str:
     os.makedirs(outdir, exist_ok=True); return outdir
 def _to_np(x: torch.Tensor) -> np.ndarray: return x.detach().cpu().numpy()
 def _linspace_time(n_steps: int) -> np.ndarray: return np.linspace(0.0, float(T), num=n_steps)
+
+# ===== (핵심 수정) P-PGDPO 래퍼 클래스 =====
 class PPDirectPolicy(nn.Module):
     def __init__(self, stage1_policy: nn.Module, seed: int):
         super().__init__(); self.stage1_policy = stage1_policy; self.seed = seed
+    
     def forward(self, **states_dict):
         if not _HAS_DIRECT: raise RuntimeError("'direct' utilities not available.")
-        return ppgdpo_u_direct(self.stage1_policy, states_dict, REPEATS_DIR, SUBBATCH_DIR, self.seed)
+        
+        # 1. P-PGDPO로 투자(u)만 프로젝션
+        u_projected = ppgdpo_u_direct(self.stage1_policy, states_dict, REPEATS_DIR, SUBBATCH_DIR, self.seed)
+
+        # 2. 원본 정책의 전체 출력을 확인하여 소비 모델인지 판별
+        with torch.no_grad():
+            original_output = self.stage1_policy(**states_dict)
+        
+        is_consumption_model = original_output.size(1) > u_projected.size(1)
+
+        if is_consumption_model:
+            # 3. 소비 모델이면, 원본 정책에서 소비(C) 값을 가져와 결합
+            c_learned = original_output[:, u_projected.size(1):]
+            return torch.cat([u_projected, c_learned], dim=1)
+        else:
+            # 4. 아니면, 프로젝션된 투자(u)만 반환
+            return u_projected
+
 class PPRUNNERPolicy(nn.Module):
     def __init__(self, stage1_policy: nn.Module, seed: int):
         super().__init__(); self.stage1_policy = stage1_policy; self.seed = seed
+    
     def forward(self, **states_dict):
         if not _HAS_RUNNER: raise RuntimeError("'runner' utilities not available.")
-        return ppgdpo_u_run(self.stage1_policy, states_dict, REPEATS_RUN, SUBBATCH_RUN, self.seed)
+
+        # PPDirectPolicy와 동일한 로직 적용
+        u_projected = ppgdpo_u_run(self.stage1_policy, states_dict, REPEATS_RUN, SUBBATCH_RUN, self.seed)
         
+        with torch.no_grad():
+            original_output = self.stage1_policy(**states_dict)
+
+        is_consumption_model = original_output.size(1) > u_projected.size(1)
+
+        if is_consumption_model:
+            c_learned = original_output[:, u_projected.size(1):]
+            return torch.cat([u_projected, c_learned], dim=1)
+        else:
+            return u_projected
+
 class RecordingPolicy(nn.Module):
     def __init__(self, base_policy: nn.Module):
         super().__init__()
         self.base_policy = base_policy
         self.X_frames, self.U_frames = [], []
         self.HarvestingIncome_frames = []
-        # ✨ [SIR] Initialize lists for Rt and Co-state
         self.Rt_frames = []
         self.Costate_I_frames = []
 
@@ -105,7 +140,6 @@ class RecordingPolicy(nn.Module):
             current_income = ((U * X) * p_device.view(1, -1)).sum(dim=1, keepdim=True)
             self.HarvestingIncome_frames.append(current_income.detach())
 
-        # ✨ [SIR] Record Rt and Co-state for SIR model
         if calculate_rt is not None:
             X = states_dict["X"].detach()
             S = X[:, 0::3]
@@ -123,7 +157,7 @@ class RecordingPolicy(nn.Module):
                         pI = JX[:, 1::3].sum(dim=1, keepdim=True)
                         self.Costate_I_frames.append(pI.detach())
                 except Exception:
-                    pass # Silently fail if costate estimation is not compatible
+                    pass
 
         return U
 
@@ -131,7 +165,6 @@ class RecordingPolicy(nn.Module):
         data = {"X": torch.stack(self.X_frames, 1), "U": torch.stack(self.U_frames, 1)}
         if hasattr(self, 'Y_frames'): data["Y"] = torch.stack(self.Y_frames, 1)
         if self.HarvestingIncome_frames: data["HarvestingIncome"] = torch.stack(self.HarvestingIncome_frames, 1)
-        # ✨ [SIR] Add recorded Rt and Co-state to the output dictionary
         if self.Rt_frames: data["Rt"] = torch.stack(self.Rt_frames, 1)
         if self.Costate_I_frames: data["Costate_I"] = torch.stack(self.Costate_I_frames, 1)
         return data
@@ -154,13 +187,19 @@ def _series_for_view(view: Dict[str, Any], traj_np: Dict[str, Any], Bsel: List[i
         arr_sel, steps = arr[Bsel], arr.shape[1]
         if x_time is None: x_time = _linspace_time(steps)
         
-        labels_info = SCHEMA.get("roles", {}).get(block_name, {}).get("labels", [])
-        indices = view.get("indices", {}).get(block_name, [0]) if isinstance(view.get("indices"), dict) else view.get("indices", [0])
+        # 'roles'에서 레이블 정보와 차원(dim)을 가져옵니다.
+        role_info = SCHEMA.get("roles", {}).get(block_name, {})
+        labels_info = role_info.get("labels", [])
+        
+        # view에서 indices를 가져옵니다.
+        indices = view.get("indices", [0])
+        
+        # 유효한 인덱스만 필터링합니다.
         valid_indices = [i for i in indices if i < arr_sel.shape[-1]]
         
         mean_series = arr_sel[..., valid_indices].mean(axis=0)
         series = [mean_series[:, i] for i in range(mean_series.shape[1])]
-        labels = [labels_info[idx] for idx in valid_indices]
+        labels = [labels_info[idx] for idx in valid_indices] if labels_info else [f"dim_{idx}" for idx in valid_indices]
         all_series.extend(series)
         all_labels.extend(labels)
         
@@ -169,7 +208,8 @@ def _series_for_view(view: Dict[str, Any], traj_np: Dict[str, Any], Bsel: List[i
 def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str | None = None) -> Optional[Tuple[np.ndarray, List[np.ndarray], List[str]]]:
     mode = (view.get("mode","") or "").lower()
     if mode == "u_rnorm":
-        U = _to_np(traj_np["U"])[Bsel]; x_time = _linspace_time(U.shape[1])
+        U = _to_np(traj_np["U"])[Bsel, :, :d] # 소비 제외
+        x_time = _linspace_time(U.shape[1])
         if "R" in _R_INFO: R = _R_INFO["R"].cpu().numpy(); u_Ru = np.einsum('bti,ij,btj->bt', U, R, U); r_norm_series = np.sqrt(u_Ru).mean(axis=0)
         else:
             alpha = _R_INFO.get("alpha", 0.0)
@@ -183,7 +223,6 @@ def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str |
             for key, values in ref_signals.items(): series.append(np.asarray(values).reshape(-1)); labels.append(f"{key}_ref")
         return x_time, series, labels
     
-    # ✨ [SIR] Custom plotting logic for SIR model
     if mode == "custom_sir_rt_plot":
         Rt = _to_np(traj_np.get("Rt"))[Bsel]
         x_time = _linspace_time(Rt.shape[1])

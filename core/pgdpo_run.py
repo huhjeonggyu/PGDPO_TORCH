@@ -83,6 +83,8 @@ def _divisors_desc(n: int):
 # ------------------------------------------------------------
 # ✨ [수정] 평가/시각화 함수: 새로운 통합 플롯 함수를 호출하도록 변경
 # ------------------------------------------------------------
+# 파일: core/pgdpo_run.py
+
 @torch.no_grad()
 def print_policy_rmse_and_samples_run(
     pol_s1: nn.Module,
@@ -99,10 +101,10 @@ def print_policy_rmse_and_samples_run(
 ) -> None:
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
-    u_learn = pol_s1(**states_dict)
+    u_learn_full = pol_s1(**states_dict)
+    
     u_pp_run = None
     if enable_pp:
-        # Check if any states exist to get the batch size
         valid_states = [v for v in states_dict.values() if v is not None]
         if not valid_states:
             raise ValueError("Cannot determine batch size because all states are None.")
@@ -110,15 +112,15 @@ def print_policy_rmse_and_samples_run(
 
         divisors = _divisors_desc(B)
         start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
-        u_pp_run = torch.empty_like(u_learn)
+        u_pp_run_calc = torch.empty(B, d, device=u_learn_full.device)
         for idx in range(start_idx, len(divisors)):
             cur_tile = divisors[idx]
             try:
                 for s in range(0, B, cur_tile):
                     e = min(B, s + cur_tile)
-                    # ✨ FIX: Add 'if v is not None' to handle cases like sir model's Y state.
                     tile_states = {k: v[s:e] for k, v in states_dict.items() if v is not None}
-                    u_pp_run[s:e] = ppgdpo_u_run(pol_s1, tile_states, repeats, sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
+                    u_pp_run_calc[s:e] = ppgdpo_u_run(pol_s1, tile_states, repeats, sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
+                u_pp_run = u_pp_run_calc
                 break
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -126,33 +128,55 @@ def print_policy_rmse_and_samples_run(
                     if idx + 1 < len(divisors): print(f"[Eval] OOM; reducing tile -> {divisors[idx+1]}"); continue
                     else: print("[Eval] OOM; could not reduce tile further."); raise
                 else: raise
-    u_cf = pol_cf(**states_dict) if pol_cf is not None else None
 
-    # RMSE 출력 및 메트릭 저장
+    u_cf_full = pol_cf(**states_dict) if pol_cf is not None else None
+
+    is_consumption_model = u_learn_full.size(1) > d
+    
+    u_learn, c_learn = (u_learn_full[:, :d], u_learn_full[:, d:]) if is_consumption_model else (u_learn_full, None)
+    u_pp, c_pp = (u_pp_run, c_learn) if u_pp_run is not None else (None, None)
+    u_cf, c_cf = (None, None)
+    if u_cf_full is not None:
+        u_cf, c_cf = (u_cf_full[:, :d], u_cf_full[:, d:]) if is_consumption_model else (u_cf_full, None)
+
+    # --- (핵심 수정) RMSE 출력 및 메트릭 저장 (투자 u와 소비 c 모두) ---
     if u_cf is not None:
-        rmse_learn = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-        print(f"[Policy RMSE] ||u_learn - u_closed-form||_RMSE: {rmse_learn:.6f}")
-        if enable_pp and (u_pp_run is not None):
-            rmse_pp = torch.sqrt(((u_pp_run - u_cf) ** 2).mean()).item()
-            print(f"[Policy RMSE-PP({prefix})] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp:.6f}")
+        # 투자(u) RMSE
+        rmse_learn_u = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
+        print(f"[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_learn_u:.6f}")
+        
+        metrics = {f"rmse_learn_cf_u_{prefix}": rmse_learn_u}
+
+        if enable_pp and (u_pp is not None):
+            rmse_pp_u = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
+            print(f"[Policy RMSE-PP (u)] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp_u:.6f}")
+            metrics[f"rmse_pp_cf_u_{prefix}"] = rmse_pp_u
+
+        # 소비(c) RMSE (소비 모델인 경우에만)
+        if is_consumption_model and c_cf is not None:
+            rmse_learn_c = torch.sqrt(((c_learn - c_cf) ** 2).mean()).item()
+            print(f"[Policy RMSE (C)] ||c_learn - c_closed-form||_RMSE: {rmse_learn_c:.6f}")
+            metrics[f"rmse_learn_cf_c_{prefix}"] = rmse_learn_c
+
+            # P-PGDPO의 소비는 learn의 소비를 따르므로, c_pp vs c_cf RMSE도 계산
+            if c_pp is not None:
+                rmse_pp_c = torch.sqrt(((c_pp - c_cf) ** 2).mean()).item()
+                print(f"[Policy RMSE-PP (C)] ||c_pp({prefix}) - c_closed-form||_RMSE: {rmse_pp_c:.6f}")
+                metrics[f"rmse_pp_cf_c_{prefix}"] = rmse_pp_c
+        
         if outdir is not None:
-            metrics = {f"rmse_learn_cf_{prefix}": rmse_learn}
-            if enable_pp and (u_pp_run is not None):
-                metrics[f"rmse_pp_cf_{prefix}"] = rmse_pp
             append_metrics_csv(metrics, outdir)
     else:
         print("[INFO] No closed-form policy provided for comparison.")
 
-    # 샘플 프리뷰
+    # --- (이하 샘플 프리뷰 및 그림 저장은 이전과 동일) ---
     if VERBOSE:
         n = min(SAMPLE_PREVIEW_N, u_learn.size(0))
         print("\n--- Sample Previews ---")
         for i in range(n):
             parts, vec = [], False
-            # 상태 프리뷰
             for k_, v in states_dict.items():
-                if v is None:
-                    continue
+                if v is None: continue
                 ts = v[i]
                 if ts.numel() > 1:
                     parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
@@ -161,37 +185,32 @@ def print_policy_rmse_and_samples_run(
             if vec: parts.append("...")
             sstr = ", ".join(parts)
     
-            # 다좌표 정책 프리뷰
-            if u_cf is not None and enable_pp and (u_pp_run is not None):
-                msg = (
-                    f"  ({sstr}) -> ("
-                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords(f'u_pp({prefix})', u_pp_run, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
-                )
-            elif u_cf is not None:
-                msg = (
-                    f"  ({sstr}) -> ("
-                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS)})"
-                )
-            elif enable_pp and (u_pp_run is not None):
-                msg = (
-                    f"  ({sstr}) -> ("
-                    f"{_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)}, "
-                    f"{_fmt_coords(f'u_pp({prefix})', u_pp_run, i, PREVIEW_COORDS)})"
-                )
-            else:
-                msg = f"  ({sstr}) -> ({_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS)})"
-            print(msg)
+            msg_parts = [f"({sstr}) -> ("]
+            msg_parts.append(_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS))
+            if c_learn is not None: msg_parts.append(f", c_learn={c_learn[i].item():.4f}")
 
-    # 그림 저장
+            if u_pp is not None:
+                msg_parts.append(", " + _fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS))
+
+            if u_cf is not None:
+                msg_parts.append(", " + _fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS))
+                if c_cf is not None: msg_parts.append(f", c_cf={c_cf[i].item():.4f}")
+            
+            msg_parts.append(")")
+            print("".join(msg_parts))
+
     if outdir is not None:
-        save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp_run, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_{prefix}_overlaid_hist.png", bins=60)
+        save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_u_{prefix}_overlaid_hist.png", bins=60)
         if u_cf is not None:
             save_combined_scatter(
-                u_ref=u_cf, u_learn=u_learn, u_pp=u_pp_run,
-                outdir=outdir, coord=0, fname=f"scatter_{prefix}_comparison.png"
+                u_ref=u_cf, u_learn=u_learn, u_pp=u_pp,
+                outdir=outdir, coord=0, fname=f"scatter_u_{prefix}_comparison.png"
+            )
+        if is_consumption_model and c_learn is not None and c_cf is not None:
+             save_combined_scatter(
+                u_ref=c_cf, u_learn=c_learn, u_pp=c_pp,
+                outdir=outdir, coord=0, fname=f"scatter_c_{prefix}_comparison.png",
+                xlabel="c_closed-form", title="Consumption Comparison"
             )
 
 # ------------------------------------------------------------
