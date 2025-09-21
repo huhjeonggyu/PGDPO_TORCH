@@ -1,11 +1,5 @@
-# core/pgdpo_with_projection.py
-# -*- coding: utf-8 -*-
-"""
-P-PGDPO (Projected PG-DPO) core — DIRECT path only
-- Mandatory user projector (project_pmp) import; if missing, raise immediately.
-- Flexible DIRECT costate estimator with injected simulator (user_pgdpo_base.simulate).
-- Direct evaluator with verbose prints (+ sample preview), and a simple standalone test harness.
-"""
+# 파일: core/pgdpo_with_projection.py
+# 모델: 소비 모델의 PMP 출력을 올바르게 처리하도록 수정된 버전
 
 from __future__ import annotations
 import os
@@ -16,8 +10,8 @@ import torch
 import torch.nn as nn
 
 # ---------------------------------------------------------------------
-# Mandatory imports from user space
-# ---------------------------------------------------------------------
+# (이하 import 및 유틸 함수는 변경 없음)
+# ...
 try:
     from user_pgdpo_base import (
         d, device, N_eval_states, CRN_SEED_EU, sample_initial_states,
@@ -47,17 +41,11 @@ def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
     parts = [f"{label}[{j}]={mat[i,j].item():.4f}" for j in range(K)]
     return (", ".join(parts)) + (", ..." if n > K else "")
 
-# ---------------------------------------------------------------------
-# Defaults (env-overridable)
-# ---------------------------------------------------------------------
 REPEATS  = int(os.getenv("PGDPO_PP_REPEATS", 2560*d))
 SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 2560))
 VERBOSE            = os.getenv("PGDPO_VERBOSE", "1") == "1"
 SAMPLE_PREVIEW_N   = int(os.getenv("PGDPO_SAMPLE_PREVIEW_N", 3))
 
-# ---------------------------------------------------------------------
-# Small utils
-# ---------------------------------------------------------------------
 def make_generator(seed: Optional[int] = None) -> torch.Generator:
     g = torch.Generator(device=device if device.type != "cpu" else "cpu")
     if seed is not None:
@@ -67,9 +55,6 @@ def make_generator(seed: Optional[int] = None) -> torch.Generator:
 def _divisors_desc(n: int):
     return sorted([d for d in range(1, n + 1) if n % d == 0], reverse=True)
 
-# ---------------------------------------------------------------------
-# Generic DIRECT costate estimator
-# ---------------------------------------------------------------------
 SimulateFn = Callable[..., torch.Tensor]
 
 def estimate_costates(
@@ -158,9 +143,6 @@ def estimate_costates(
     finally:
         for p, r in zip(params, req_bak): p.requires_grad_(r)
 
-# ---------------------------------------------------------------------
-# Direct projector helper
-# ---------------------------------------------------------------------
 def ppgdpo_u_direct(
     pol_s1: nn.Module,
     states: Dict[str, torch.Tensor],
@@ -180,7 +162,7 @@ def ppgdpo_u_direct(
         return u.detach()
 
 # ---------------------------------------------------------------------
-# Public evaluator (DIRECT)
+# (✨✨✨ 핵심 수정 부분 시작 ✨✨✨)
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def print_policy_rmse_and_samples_direct(
@@ -197,13 +179,18 @@ def print_policy_rmse_and_samples_direct(
     gen = make_generator(seed_eval or CRN_SEED_EU)
     states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
     
-    # --- (핵심 수정) ---
-    # 1. 전체 정책 출력을 받아 소비 모델 여부 확인 및 분리
+    # 1. 학습된 정책과 벤치마크 정책의 출력을 u와 c로 분리 (기존과 동일)
     u_learn_full = pol_s1(**states_dict)
     is_consumption_model = u_learn_full.size(1) > d
     u_learn, c_learn = (u_learn_full[:, :d], u_learn_full[:, d:]) if is_consumption_model else (u_learn_full, None)
     
-    u_pp = None
+    u_cf_full = pol_cf(**states_dict) if pol_cf is not None else None
+    u_cf, c_cf = (None, None)
+    if u_cf_full is not None:
+        u_cf, c_cf = (u_cf_full[:, :d], u_cf_full[:, d:]) if is_consumption_model else (u_cf_full, None)
+
+    # 2. P-PGDPO 정책 계산
+    u_pp, c_pp = None, None
     try:
         valid_states = [v for v in states_dict.values() if v is not None]
         if not valid_states: raise ValueError("Cannot determine batch size because all states are None.")
@@ -212,8 +199,10 @@ def print_policy_rmse_and_samples_direct(
         divisors = _divisors_desc(B)
         start_idx = next((i for i, d_ in enumerate(divisors) if d_ <= (tile or B)), 0)
         
-        # 2. PMP는 투자(u) 파트만 계산하도록 크기 변경
-        u_pp_calc = torch.empty_like(u_learn) # (B, d) 크기
+        # 3. ✨ 수정: PMP의 전체 출력(u와 C)을 받을 텐서 준비
+        #    is_consumption_model에 따라 동적으로 크기 결정 (d+1 또는 d)
+        pp_full_output_size = d + 1 if is_consumption_model else d
+        u_pp_full_calc = torch.empty(B, pp_full_output_size, device=u_learn.device, dtype=u_learn.dtype)
         
         for idx in range(start_idx, len(divisors)):
             cur_tile = divisors[idx]
@@ -221,9 +210,17 @@ def print_policy_rmse_and_samples_direct(
                 for s in range(0, B, cur_tile):
                     e = min(B, s + cur_tile)
                     tile_states = {k: v[s:e] for k, v in states_dict.items() if v is not None}
-                    u_pp_calc[s:e] = ppgdpo_u_direct(pol_s1, tile_states, repeats=repeats, sub_batch=sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
-                u_pp = u_pp_calc
-                break
+                    # ✨ 수정: 전체 PMP 출력을 u_pp_full_calc에 저장
+                    u_pp_full_calc[s:e] = ppgdpo_u_direct(pol_s1, tile_states, repeats=repeats, sub_batch=sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
+                
+                # 4. ✨ 수정: 계산된 전체 PMP 출력을 u_pp와 c_pp로 분리
+                if is_consumption_model:
+                    u_pp = u_pp_full_calc[:, :d]
+                    c_pp = u_pp_full_calc[:, d:]
+                else:
+                    u_pp = u_pp_full_calc
+
+                break 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -232,21 +229,11 @@ def print_policy_rmse_and_samples_direct(
                 else: raise
     except Exception as e:
         print(f"\n[Eval] ERROR: An unexpected error occurred during PMP projection: {e}")
-        u_pp = None
-    
-    # 3. 벤치마크 정책도 u와 c로 분리
-    u_cf_full = pol_cf(**states_dict) if pol_cf is not None else None
-    u_cf, c_cf = (None, None)
-    if u_cf_full is not None:
-        u_cf, c_cf = (u_cf_full[:, :d], u_cf_full[:, d:]) if is_consumption_model else (u_cf_full, None)
-    
-    # 4. P-PGDPO의 소비(c_pp)는 학습된 정책의 소비(c_learn)를 따름
-    c_pp = c_learn if u_pp is not None else None
-    
-    # 5. RMSE와 샘플 출력을 u와 c에 대해 각각 수행
+        u_pp, c_pp = None, None
+
+    # 5. RMSE 및 샘플 출력 (이제 u_pp와 c_pp가 모두 준비되어 있으므로, 기존 로직 그대로 사용 가능)
     prefix = "direct"
     if u_cf is not None:
-        # 투자(u) RMSE
         rmse_learn_u = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
         print(f"\n[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_learn_u:.6f}")
         metrics = {f"rmse_learn_cf_u_{prefix}": rmse_learn_u}
@@ -255,7 +242,6 @@ def print_policy_rmse_and_samples_direct(
             print(f"[Policy RMSE-PP (u)] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp_u:.6f}")
             metrics[f"rmse_pp_cf_u_{prefix}"] = rmse_pp_u
 
-        # 소비(c) RMSE
         if is_consumption_model and c_cf is not None:
             rmse_learn_c = torch.sqrt(((c_learn - c_cf) ** 2).mean()).item()
             print(f"[Policy RMSE (C)] ||c_learn - c_closed-form||_RMSE: {rmse_learn_c:.6f}")
@@ -288,12 +274,17 @@ def print_policy_rmse_and_samples_direct(
             msg_parts = [f"  ({sstr}) -> ("]
             msg_parts.append(_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS))
             if c_learn is not None: msg_parts.append(f", c_learn={c_learn[i].item():.4f}")
-            if u_pp is not None: msg_parts.append(", " + _fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS))
+            if u_pp is not None:
+                msg_parts.append(", " + _fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS))
+                if c_pp is not None: msg_parts.append(f", c_pp={c_pp[i].item():.4f}")
             if u_cf is not None:
                 msg_parts.append(", " + _fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS))
                 if c_cf is not None: msg_parts.append(f", c_cf={c_cf[i].item():.4f}")
             msg_parts.append(")")
             print("".join(msg_parts))
+# ---------------------------------------------------------------------
+# (✨✨✨ 핵심 수정 부분 끝 ✨✨✨)
+# ---------------------------------------------------------------------
 
 def main():
     from pgdpo_base import run_common, train_stage1_base

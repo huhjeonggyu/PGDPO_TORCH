@@ -1,186 +1,91 @@
-# tests/<model>/user_pgdpo_with_projection.py
-# ---------------------------------------------------------------------
-# P-PGDPO 사영(project_pmp): 코스테이트(JX,JXX)를 받아 포트폴리오 u를
-# 장벽 뉴턴법으로 즉시 계산합니다.
-# - 제약: u >= 0, 1^T u <= L_cap  (무차입)
-# - 목적(단계별 해밀토니안 근사):
-#     H(u) = s * ( alpha^T u - 0.5 * gamma * u^T Sigma u )
-#             + eps_bar * ( sum_i log u_i + log(L_cap - 1^T u) )
-#   여기서 s = - JX / (X * JXX)  (CRRA에선 s = 1/gamma에 수렴).
-#
-# 주: 소비 C는 상대상한 C <= alpha_rel * X 로 베이스에서 처리합니다.
-#     본 모듈은 u만 투영합니다.
-# ---------------------------------------------------------------------
+# 파일: tests/mt_nd_max_c/user_pgdpo_with_projection.py
+# 모델: 소비 상한 모델 (PMP가 투자와 소비를 각각 최적화) - 최종 수정 버전
 
 from __future__ import annotations
 import torch
 
-# 베이스 심볼 가져오기
+# user_pgdpo_base.py에서 필요한 심볼 가져오기
 try:
-    from user_pgdpo_base import alpha as ALPHA_CONST, Sigma as SIGMA_CONST, Sigma_inv as SIGMAi_CONST, gamma as GAMMA_CONST
+    from user_pgdpo_base import (
+        alpha as ALPHA_CONST,
+        Sigma_inv as SIGMAi_CONST,
+        gamma as GAMMA_CONST,
+        C_abs_cap as C_MAX_CONST # 고정 소비 상한을 가져옴
+    )
 except Exception as e:
-    raise RuntimeError("[with_projection] user_pgdpo_base에서 alpha, Sigma, Sigma_inv, gamma를 찾지 못했습니다.") from e
-
-# 선택: L_cap, alpha_rel을 가져오되, 없으면 기본값 사용
-try:
-    from user_pgdpo_base import L_cap as L_CAP_CONST
-except Exception:
-    L_CAP_CONST = 1.0
+    raise RuntimeError("[with_projection] user_pgdpo_base에서 필요한 심볼을 찾지 못했습니다.") from e
 
 # 코어가 필요로 하는 코스테이트 키
 PP_NEEDS = ("JX", "JXX")
 
-# 하이퍼파라미터
+# 최적화 하이퍼파라미터
 PP_OPTS = {
-    "L_cap": float(L_CAP_CONST),  # 합계 캡
-    "eps_bar": 1e-3,              # 장벽 세기
-    "ridge": 1e-12,               # 선형계 안정화
-    "tau": 0.95,                  # fraction-to-the-boundary
-    "armijo": 1e-4,               # Armijo(최대화)
-    "backtrack": 0.5,             # 역추적 비율
-    "max_newton": 30,             # 뉴턴 반복
-    "tol_grad": 1e-8,             # ∥grad∥_∞ 허용오차
-    "interior_shrink": 1e-6,      # 초기 interior 여유
+    "C_min": 1e-5,       # 소비 하한
+    "eps_bar": 1e-7,     # 장벽 세기
+    "max_newton": 15,    # 뉴턴 최대 반복
+    "tol_grad": 1e-8,    # 수렴 허용오차
+    "tau": 0.95,         # ✨ 수정: 누락되었던 'tau' 파라미터 추가
 }
-
 
 @torch.no_grad()
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     """
-    입력:
-      costates: {"JX": (B,1), "JXX": (B,1)}
-      states:   {"X": (B,1), "TmT": (B,1), ...}
-    출력:
-      u: (B, d)  — 포트폴리오(제약만족)
+    PMP에 따라 최적 포트폴리오(u)와 최적 소비(C)를 각각 계산합니다.
     """
-    alpha = ALPHA_CONST.view(-1)                 # (d,)
-    Sigma = SIGMA_CONST                          # (d,d)
+    # --- 상태 및 파라미터 준비 ---
+    X = states["X"]
+    JX = costates["JX"]
+    JXX = costates["JXX"]
+    B = X.shape[0]
+    device = X.device
+    
+    # --- 1. 최적 포트폴리오 u* 계산 (제약 없음) ---
+    denominator = (X * JXX).clamp(max=-1e-12)
+    s = (-JX / denominator)
+    alpha = ALPHA_CONST.view(1, -1)
     Sigma_inv = SIGMAi_CONST
-    gamma = float(GAMMA_CONST)
-    d = alpha.numel()
-    device = alpha.device
-
-    X = states["X"].view(-1, 1)                  # (B,1)
-    JX = costates["JX"].view(-1, 1)              # (B,1)
-    JXX = costates["JXX"].view(-1, 1)            # (B,1)
-
-    B = X.size(0)
-    L_cap = float(PP_OPTS["L_cap"])
+    portfolio_direction = (Sigma_inv @ alpha.T).T
+    u_optimal = s * portfolio_direction
+    
+    # --- 2. 최적 소비 C* 계산 (제약 있음, 뉴턴법 사용) ---
+    C_optimal = torch.empty(B, 1, device=device, dtype=X.dtype)
+    gamma_val = float(GAMMA_CONST)
     eps_bar = float(PP_OPTS["eps_bar"])
-    ridge0 = float(PP_OPTS["ridge"])
-    tau = float(PP_OPTS["tau"])
-    c1 = float(PP_OPTS["armijo"])
-    back = float(PP_OPTS["backtrack"])
-    max_newton = int(PP_OPTS["max_newton"])
-    tol_g = float(PP_OPTS["tol_grad"])
-    interior_eps = float(PP_OPTS["interior_shrink"])
+    C_max = float(C_MAX_CONST)
+    C_min = float(PP_OPTS["C_min"])
+    tau = float(PP_OPTS["tau"]) # ✨ 수정: tau 값을 변수로 사용
 
-    ones = torch.ones(d, device=device, dtype=alpha.dtype)
-
-    # 스칼라 계수 s = -JX / (X * JXX) (작은 값 방지)
-    denom = (X * JXX).clamp_min(1e-12)
-    s = (-JX / denom).view(-1)    # (B,)
-
-    # 초기값: 무제약 마이오픽을 양수/심플렉스로 투영, strict interior로 약간 shrink
-    u_unc = (1.0 / gamma) * (Sigma_inv @ alpha)       # (d,)
-    u0 = u_unc.clamp_min(0.0)
-    ssum = float(u0.sum().item())
-    if ssum > L_cap:
-        # equality simplex로 투영
-        u_sorted = torch.sort(u0, descending=True).values
-        cssv = torch.cumsum(u_sorted, dim=0) - L_cap
-        j = torch.arange(1, d+1, device=device, dtype=u0.dtype)
-        cond = u_sorted > (cssv / j)
-        if cond.any():
-            rho_idx = int(torch.nonzero(cond, as_tuple=False)[-1].item())
-            theta = cssv[rho_idx] / float(rho_idx + 1)
-        else:
-            theta = cssv[-1] / float(d)
-        u0 = (u0 - theta).clamp_min(0.0)
-    # strict interior로
-    if u0.sum().item() >= L_cap:
-        u0 = (L_cap - interior_eps) * u0 / (u0.sum() + 1e-12)
-    u0 = u0.clamp_min(interior_eps)
-
-    # 배치별 뉴턴
-    u = torch.empty(B, d, device=device, dtype=alpha.dtype)
-    # 미리 준비
-    chol_S = None  # 미사용이지만, 동일성 유지
-
-    # 내부 함수들
-    def Hbar(u_vec: torch.Tensor, sb: float) -> torch.Tensor:
-        slack = L_cap - u_vec.sum()
-        if slack <= 0 or (u_vec <= 0).any():
-            return torch.tensor(float("-inf"), device=device, dtype=u_vec.dtype)
-        quad = -0.5 * gamma * (u_vec @ (Sigma @ u_vec))
-        lin  = alpha @ u_vec
-        return sb * (lin + quad) + eps_bar * (torch.log(u_vec).sum() + torch.log(slack))
-
-    def grad_Hbar(u_vec: torch.Tensor, sb: float) -> torch.Tensor:
-        # g = s*(alpha - gamma*Sigma u) + eps*(1/u) - eps/(slack) * 1
-        slack = L_cap - u_vec.sum()
-        inv_u = 1.0 / u_vec
-        g = sb * (alpha - gamma * (Sigma @ u_vec)) + eps_bar * inv_u - (eps_bar / slack) * ones
-        return g
-
-    def hess_Hbar(u_vec: torch.Tensor, sb: float) -> torch.Tensor:
-        # H = - s*gamma*Sigma - eps*diag(1/u^2) - eps/(slack^2) * 11^T
-        slack = L_cap - u_vec.sum()
-        H = (- sb * gamma) * Sigma.clone()
-        H = H - eps_bar * torch.diag((1.0 / (u_vec ** 2)))
-        H = H - (eps_bar / (slack ** 2)) * (ones.view(-1,1) @ ones.view(1,-1))
-        return H
-
+    # 각 배치 샘플에 대해 독립적으로 1차원 뉴턴법 수행
     for b in range(B):
-        sb = float(s[b].item())
-        ub = u0.clone()
+        jx_b = JX[b].item()
+        c_b = (jx_b + 1e-9)**(-1.0 / gamma_val)
+        c_b = min(max(c_b, C_min), C_max)
+        if c_b <= C_min: c_b = C_min * 1.01
+        if c_b >= C_max: c_b = C_max * 0.99
 
-        # 뉴턴-백트래킹 반복
-        val = Hbar(ub, sb)
-        ridge = ridge0
-        for it in range(max_newton):
-            g = grad_Hbar(ub, sb)
-            if torch.isfinite(g).all() and float(g.abs().max().item()) < tol_g:
+        for _ in range(PP_OPTS["max_newton"]):
+            c_minus_min = c_b - C_min
+            c_max_minus_c = C_max - c_b
+            
+            f_c = c_b**(-gamma_val) - jx_b + eps_bar / c_minus_min - eps_bar / c_max_minus_c
+            
+            if abs(f_c) < PP_OPTS["tol_grad"]:
                 break
-            H = hess_Hbar(ub, sb)
+            
+            df_c = -gamma_val * c_b**(-gamma_val - 1) - eps_bar / (c_minus_min**2) - eps_bar / (c_max_minus_c**2)
+            
+            step = -f_c / (df_c - 1e-12)
+            
+            # ✨ 수정: tau를 사용하여 라인 서치 수행
+            alpha_step = 1.0
+            if step < 0:
+                alpha_step = min(alpha_step, tau * (-c_minus_min / step))
+            if step > 0:
+                alpha_step = min(alpha_step, tau * (c_max_minus_c / step))
 
-            # 안정화: H + (-ridge)I (음의 definite 유지), 실패시 pinv fallback
-            try:
-                # 선형계 풀이 (최대화: H d = -g)
-                dlt = torch.linalg.solve(H - ridge * torch.eye(d, device=device, dtype=H.dtype), -g)
-            except RuntimeError:
-                dlt = torch.linalg.pinv(H) @ (-g)
+            c_b = c_b + alpha_step * step
+        
+        C_optimal[b] = c_b
 
-            # fraction-to-the-boundary
-            # u + a d > 0  and  slack(u + a d) > 0
-            a_max = 1.0
-            neg_idx = (dlt < 0)
-            if neg_idx.any():
-                a_max = min(a_max, float(( -tau * ub[neg_idx] / dlt[neg_idx] ).min().item()))
-            d_slack = - float(dlt.sum().item())
-            if d_slack > 0:
-                a_max = min(a_max, float(tau * (L_cap - float(ub.sum().item())) / d_slack))
-            a = a_max
-
-            # Armijo 백트래킹
-            f0 = float(val.item()) if torch.isfinite(val) else float("-inf")
-            gTd = float(g.dot(dlt).item())
-            accepted = False
-            for _ls in range(20):
-                uc = ub + a * dlt
-                # 엄격 내부 확인
-                if (uc > 0).all() and (uc.sum().item() < L_cap):
-                    f1t = Hbar(uc, sb)
-                    if torch.isfinite(f1t) and (f1t.item() >= f0 + c1 * a * gTd):
-                        ub = uc
-                        val = f1t
-                        accepted = True
-                        break
-                a *= back
-            if not accepted:
-                # 진전 없으면 종료
-                break
-
-        u[b] = ub
-
-    return u
+    # --- 3. u*와 C*를 결합하여 반환 ---
+    return torch.cat([u_optimal, C_optimal], dim=1)

@@ -1,81 +1,59 @@
-# tests/<model>/user_pgdpo_residual.py
-# ------------------------------------------------------------
-# Residual 모드 베이스 정책(Myopic) + 스케일 설정
-# - 코어는 여기서 MyopicPolicy, ResCap 을 import 합니다.
-# - MyopicPolicy.forward: u_myopic (고정), 잔차는 코어 ResidualPolicy가 학습
-# - MyopicPolicy.consumption: 상대상한이 없다고 가정한 평시(consumption-unconstrained) 비례소비를 사용,
-#   단, 항상 C <= alpha_rel * X 를 보장 (min).
-# ------------------------------------------------------------
+# 파일: tests/mt_nd_max_c/user_pgdpo_residual.py
+# 모델: 소비 상한 모델 (고정된 절대값 상한) - 수정된 버전
 
 from __future__ import annotations
 import os
 import torch
 import torch.nn as nn
 
+# user_pgdpo_base.py에서 필요한 파라미터 가져오기
 from user_pgdpo_base import (
-    alpha as ALPHA_CONST,     # (d,)
-    Sigma_inv as SIGMAi_CONST,  # (d,d)
-    gamma as GAMMA_CONST,     # float
+    alpha as ALPHA_CONST,
+    Sigma_inv as SIGMAi_CONST,
+    gamma as GAMMA_CONST,
+    rho as RHO_CONST,
+    r as R_CONST,
+    # ✨ 수정: alpha_rel 대신 C_abs_cap를 import
+    C_abs_cap as C_ABS_CAP_CONST 
 )
-
-# 옵션 심볼 (없으면 기본값 사용)
-try:
-    from user_pgdpo_base import L_cap as L_CAP_CONST
-except Exception:
-    L_CAP_CONST = 1.0
-
-try:
-    from user_pgdpo_base import alpha_rel as ALPHA_REL_CONST
-except Exception:
-    ALPHA_REL_CONST = 0.30
 
 # 잔차 크기 스케일(코어가 import)
 ResCap = float(os.getenv("PGDPO_RES_CAP", 0.10))
 
-# 소비 기본 비율(제약 안 걸렸을 때의 소비 성향), 0~1 사이 권장
-C_FRAC = float(os.getenv("PGDPO_C_FRAC", 0.50))
-
-
 class MyopicPolicy(nn.Module):
     """
-    MyopicPolicy는 이제 투자(u)와 소비(C)를 결합하여 반환합니다.
+    MyopicPolicy는 제약 없는 표준 머튼 해를 기준 투자(u)로 사용하고,
+    이론적 최적 소비율(m*)에 고정 상한을 적용하여 기준 소비(C)를 계산합니다.
     """
     def __init__(self):
         super().__init__()
-        # u_star 계산 로직은 기존과 동일
-        u_unc = (1.0 / float(GAMMA_CONST)) * (SIGMAi_CONST @ ALPHA_CONST)
-        u0 = u_unc.clamp_min(0.0)
-        ssum = float(u0.sum().item())
-        L_cap = float(L_CAP_CONST)
-        d = u0.numel()
+        
+        # 1. 기준 투자 u_star 계산 (제약 없는 표준 머튼 해)
+        u_star = (1.0 / float(GAMMA_CONST)) * (SIGMAi_CONST @ ALPHA_CONST)
+        self.register_buffer("u_star", u_star.view(-1))
 
-        if ssum > L_cap:
-            u_sorted = torch.sort(u0, descending=True).values
-            cssv = torch.cumsum(u_sorted, dim=0) - L_cap
-            j = torch.arange(1, d + 1, device=u0.device, dtype=u0.dtype)
-            cond = u_sorted > (cssv / j)
-            if cond.any():
-                rho_idx = int(torch.nonzero(cond, as_tuple=False)[-1].item())
-                theta = cssv[rho_idx] / float(rho_idx + 1)
-            else:
-                theta = cssv[-1] / float(d)
-            u0 = (u0 - theta).clamp_min(0.0)
-
-        self.register_buffer("u_star", u0.view(-1))
+        # 2. 기준 소비율 m* 계산
+        theta_sq = (ALPHA_CONST.T @ SIGMAi_CONST @ ALPHA_CONST).item()
+        gamma_val = float(GAMMA_CONST)
+        rho_val = float(RHO_CONST)
+        r_val = float(R_CONST)
+        
+        m_star = (rho_val - (1 - gamma_val) * (r_val + theta_sq / (2 * gamma_val))) / gamma_val
+        self.m_star = m_star
 
     @torch.no_grad()
     def forward(self, **states_dict):
         X = states_dict.get("X")
-        B = X.shape[0] if X is not None else 1
+        if X is None:
+            raise ValueError("MyopicPolicy requires state 'X'.")
+        B = X.shape[0]
         
         # 1. 기준 투자 u_star 생성
         u = self.u_star.unsqueeze(0).expand(B, -1)
 
-        # 2. 기준 소비 C 계산
-        alpha_rel = float(ALPHA_REL_CONST)
-        c_frac = float(C_FRAC)
-        C_prop = c_frac * X
-        C_cap  = alpha_rel * X
+        # 2. ✨ 수정: 기준 소비 C를 고정 상한(C_ABS_CAP_CONST)을 사용하여 계산
+        C_prop = self.m_star * X
+        C_cap  = torch.full_like(X, float(C_ABS_CAP_CONST))
         C = torch.minimum(C_prop, C_cap)
 
         # 3. u와 C를 결합하여 (B, d+1) 형태로 반환

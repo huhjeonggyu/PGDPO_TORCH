@@ -324,14 +324,28 @@ def _save_full_trajectories_to_csv(
 
 def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = {}):
     is_dual_axis = view_opts.get("mode") == "dual_axis"
-    fig, ax1 = plt.subplots(figsize=(8.5, 4.5))
-    ax2 = ax1.twinx() if is_dual_axis else None
+    
+    # --- ✨ 수정된 부분 시작 ---
+
+    # 1. 기본 스타일과 라벨을 먼저 정의합니다.
     POLICY_STYLES = {
         "cf":    {"color": "royalblue", "ls": "-",  "lw": 2.5, "zorder": 5, "label": "Ref/Myopic"},
         "pp":    {"color": "orangered", "ls": "--", "lw": 1.8, "zorder": 4, "label": "P-PGDPO (pp)", "marker": 'o', "ms": 4, "alpha": 0.7},
         "learn": {"color": "forestgreen", "ls": ":",  "lw": 1.8, "zorder": 3, "label": "Learned", "marker": 's', "ms": 4, "alpha": 0.7},
         "ref":   {"color": "gray", "ls": "-.", "lw": 1.5, "zorder": 2}
     }
+
+    # 2. user_pgdpo_base.py의 get_traj_schema에 custom 라벨이 정의되어 있으면, 기본값을 덮어씁니다.
+    if "legend_labels" in SCHEMA:
+        custom_labels = SCHEMA["legend_labels"]
+        for policy_key, new_label in custom_labels.items():
+            if policy_key in POLICY_STYLES:
+                POLICY_STYLES[policy_key]["label"] = new_label
+    
+    # --- ✨ 수정된 부분 끝 ---
+
+    fig, ax1 = plt.subplots(figsize=(8.5, 4.5))
+    ax2 = ax1.twinx() if is_dual_axis else None
     
     ax_map = {}
     if is_dual_axis:
