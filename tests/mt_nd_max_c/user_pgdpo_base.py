@@ -20,7 +20,7 @@ N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100)); CRN_SEED_EU = int(os.g
 # --------------------------- 경제 파라미터 (변경 없음) ---------------------------
 gamma = float(os.getenv("PGDPO_GAMMA", 2.0)); rho   = float(os.getenv("PGDPO_RHO", 0.10))
 r     = float(os.getenv("PGDPO_RF", 0.03)); kappa = float(os.getenv("PGDPO_KAPPA", 1.0))
-C_abs_cap = float(os.getenv("PGDPO_C_CAP", 0.15))
+C_abs_cap = float(os.getenv("PGDPO_C_CAP", 10.15))
 L_cap = float(os.getenv("PGDPO_LCAP", 3.0)) 
 X0_range = (0.1, 3.0); lb_X = 1e-6
 
@@ -68,22 +68,62 @@ chol_S = torch.linalg.cholesky(Sigma)
 # --------------------------- 유틸 및 정책 ---------------------------
 
 class DirectPolicy(nn.Module):
+    """
+    두 단계 정책:
+      1) consumption_net: (X, TmT) -> C (절대 소비)
+      2) investment_net: (X_eff, TmT) -> u  where  X_eff = X - C  (기본)
+         - 환경변수 PGDPO_TWO_STAGE_MODE=dt 로 설정하면 X_eff = X - C*dt 로 변경
+    """
     def __init__(self):
-        super().__init__(); state_dim = DIM_X + DIM_Y + 1; hid = 200
-        self.net = nn.Sequential(nn.Linear(state_dim, hid), nn.LeakyReLU(), nn.Linear(hid, hid), nn.LeakyReLU(), nn.Linear(hid, d + 1))
-    
-    def forward(self, **states_dict):
+        super().__init__()
+        state_dim = DIM_X + DIM_Y + 1
+        hid = 200
+        # 1) 소비망: 스칼라 출력(logit) -> sigmoid -> 비율 -> 절대 소비
+        self.consumption_net = nn.Sequential(
+            nn.Linear(state_dim, hid), nn.LeakyReLU(),
+            nn.Linear(hid, hid), nn.LeakyReLU(),
+            nn.Linear(hid, 1)
+        )
+        # 2) 투자망: d차원 출력 -> tanh -> [-L_cap, L_cap] 스케일
+        self.investment_net  = nn.Sequential(
+            nn.Linear(state_dim, hid), nn.LeakyReLU(),
+            nn.Linear(hid, hid), nn.LeakyReLU(),
+            nn.Linear(hid, d)
+        )
+        # 시뮬레이터가 두 단계 경로를 사용할지 식별용 플래그
+        self.two_stage = True
+
+    # --- Stage 1: C(X, TmT)
+    def forward_consumption(self, **states_dict):
         z = torch.cat([states_dict["X"], states_dict["TmT"]], dim=1)
-        raw_output = self.net(z)
-        
-        u = L_cap * torch.tanh(raw_output[:, :d])
-        
-        # ✨ 최종 수정: 신경망은 '소비 비율'을 제안하고, 여기에 고정 상한을 적용
-        consumption_ratio = torch.sigmoid(raw_output[:, d:]) # (0, 1) 사이의 비율
-        proposed_C = states_dict["X"] * consumption_ratio
-        C = torch.min(proposed_C, torch.full_like(proposed_C, C_abs_cap))
-        
+        ratio = torch.sigmoid(self.consumption_net(z))  # (0,1)
+        C_prop = states_dict["X"] * ratio
+        C = torch.minimum(C_prop, torch.full_like(C_prop, C_abs_cap))
+        return C
+
+    # --- Stage 2: u(X_eff, TmT)
+    def forward_investment(self, **states_dict):
+        z_inv = torch.cat([states_dict["X"], states_dict["TmT"]], dim=1)
+        u_raw = self.investment_net(z_inv)
+        u = L_cap * torch.tanh(u_raw)
+        return u
+
+    def forward(self, **states_dict):
+        C = self.forward_consumption(**states_dict)
+
+        # 효과적 웰스 계산 규칙: 기본은 X - C,  환경변수로 dt 모드 선택 가능
+        mode = os.getenv("PGDPO_TWO_STAGE_MODE", "abs").lower()  # 'abs' | 'dt'
+        X = states_dict["X"]
+        if mode == "dt":
+            # heuristic: 현재 step의 dt를 TmT/m로 근사
+            dt_guess = (states_dict["TmT"] / m).clamp_min(0.0)
+            X_eff = (X - C * dt_guess).clamp_min(lb_X)
+        else:
+            X_eff = (X - C).clamp_min(lb_X)
+
+        u = self.forward_investment(X=X_eff, TmT=states_dict["TmT"])
         return torch.cat([u, C], dim=1)
+
 
 class WrappedCFPolicy(nn.Module):
     def __init__(self, u_star, c_cap_abs, c_frac):
@@ -114,26 +154,46 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     Z = random_draws[0] if random_draws is not None else torch.randn(B, m_eff, d, device=device, generator=rng)
     logX, TmT0 = torch.log(states["X"].clamp_min(lb_X)), states["TmT"]
     util_cons = torch.zeros((B, 1), device=device)
+
+    TWO_STAGE_MODE = os.getenv("PGDPO_TWO_STAGE_MODE", "abs").lower()  # 'abs' | 'dt'
+
     for i in range(m_eff):
         t_i = T - (TmT0 - i * dt)
         current_X = torch.exp(logX)
         cur_states = {"X": current_X, "TmT": TmT0 - i * dt}
-        
-        policy_output = policy(**cur_states)
-        u, C = policy_output[:, :d], policy_output[:, d:]
-        
-        # ✨ 최종 수정: 파산 방지 로직은 안정성을 위해 유지
-        C = torch.min(C, current_X)
-        
-        drift = r + (u * alpha).sum(1, keepdim=True) - 0.5 * (u.unsqueeze(1)@Sigma@u.unsqueeze(-1)).squeeze(-1) - C/current_X
+
+        if getattr(policy, "two_stage", False):
+            # 1) 소비 먼저
+            C = policy.forward_consumption(**cur_states)
+            C = torch.min(C, current_X)  # 파산 방지
+
+            # 2) 소비 반영한 웰스에서 투자 결정
+            if TWO_STAGE_MODE == "dt":
+                X_eff = (current_X - C * dt).clamp_min(lb_X)
+            else:
+                X_eff = (current_X - C).clamp_min(lb_X)
+
+            u = policy.forward_investment(X=X_eff, TmT=cur_states["TmT"])
+        else:
+            # 단일 네트워크 경로(기존)
+            out = policy(**cur_states)
+            u, C = out[:, :d], out[:, d:]
+            C = torch.min(C, current_X)  # 파산 방지
+
+        # --- 동학 업데이트(소비는 연속시간 흐름으로 logX에서 -C/X * dt 반영) ---
+        drift = r + (u * alpha).sum(1, keepdim=True) \
+                  - 0.5 * (u.unsqueeze(1) @ Sigma @ u.unsqueeze(-1)).squeeze(-1) \
+                  - C / current_X
         dBX = (u @ chol_S * Z[:, i, :]).sum(1, keepdim=True)
         logX += drift * dt + dBX * dt.sqrt()
-        
-        uC = (C.clamp_min(1e-12).pow(1-gamma)-1)/(1-gamma) if gamma!=1.0 else torch.log(C.clamp_min(1e-12))
+
+        # 효용 적분
+        uC = (C.clamp_min(1e-12).pow(1-gamma)-1)/(1-gamma) if gamma != 1.0 else torch.log(C.clamp_min(1e-12))
         util_cons += torch.exp(-rho * t_i) * uC * dt
-        
-    uT = (torch.exp(logX).pow(1-gamma)-1)/(1-gamma) if gamma!=1.0 else logX
+
+    uT = (torch.exp(logX).pow(1-gamma)-1)/(1-gamma) if gamma != 1.0 else logX
     return (util_cons + kappa * math.exp(-rho * T) * uT).view(-1)
+
 
 def get_traj_schema():
     u_labels = [f"u_{i+1}" for i in range(d)] + ["Consumption"]

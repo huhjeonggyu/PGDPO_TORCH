@@ -26,7 +26,7 @@ PP_OPTS = {
     "max_newton": 15,   # 뉴턴 최대 반복 (배리어 모드)
     "tol_grad": 1e-8,   # 수렴 허용오차 (배리어 모드)
     "tau": 0.95,        # fraction-to-the-boundary (배리어 모드)
-    "use_closed_form_C": True,  # True면 닫힌형+클램프, False면 배리어-뉴턴
+    "use_closed_form_C": False ,  # True면 닫힌형+클램프, False면 배리어-뉴턴
 }
 
 @torch.no_grad()
