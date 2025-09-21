@@ -271,6 +271,57 @@ def _save_series_to_csv(x_time, all_views_data, out_path):
         writer.writerows(rows)
     print(f"[traj] Trajectory data saved to: {os.path.basename(out_path)}")
 
+def _save_full_trajectories_to_csv(
+    trajectories: Dict[str, Optional[Dict[str, torch.Tensor]]],
+    schema: Dict[str, Any],
+    Bsel: List[int],
+    out_path: str
+):
+    """모든 정책의 모든 상태/제어 변수를 CSV 파일로 저장합니다."""
+    if not trajectories: return
+
+    # 1. 시간 축 생성
+    first_valid_traj = next((t for t in trajectories.values() if t is not None), None)
+    if first_valid_traj is None: return
+    n_steps = first_valid_traj['X'].shape[1]
+    x_time = _linspace_time(n_steps)
+
+    # 2. 헤더 생성
+    header = ["Time"]
+    all_data_map = {}
+    
+    roles = schema.get("roles", {})
+    
+    for policy_name, traj_data in trajectories.items():
+        if traj_data is None: continue
+        
+        # 각 데이터 블록 (X, U 등)에 대해
+        for block_name, block_tensor in traj_data.items():
+            if block_name not in roles: continue
+            
+            # Bsel 샘플들의 평균을 계산
+            block_np_avg = _to_np(block_tensor[Bsel]).mean(axis=0) # (n_steps, dim)
+            
+            labels = roles[block_name].get("labels", [f"{block_name}_{i}" for i in range(block_np_avg.shape[1])])
+            
+            for i in range(block_np_avg.shape[1]):
+                col_name = f"{labels[i]}_{policy_name}"
+                header.append(col_name)
+                all_data_map[col_name] = block_np_avg[:, i]
+
+    # 3. CSV 파일 작성
+    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        
+        for i in range(n_steps):
+            row = [x_time[i]]
+            for col_name in header[1:]:
+                row.append(all_data_map.get(col_name, np.array([]))[i])
+            writer.writerow(row)
+            
+    print(f"[traj] Full trajectory data saved to: {os.path.basename(out_path)}")
+
 def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = {}):
     is_dual_axis = view_opts.get("mode") == "dual_axis"
     fig, ax1 = plt.subplots(figsize=(8.5, 4.5))
@@ -345,6 +396,7 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
     trajectories = {"learn": traj_learn, "cf": traj_cf, "pp": traj_pp}
     Bsel = list(range(min(B_all, SCHEMA.get("sampling", {}).get("Bmax", 5))))
     
+    # --- 기존 시각화 및 요약 CSV 저장 로직 ---
     all_views_data = {}
     master_x_time = None
 
@@ -356,8 +408,10 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
             
             curr_x, series, labels = _series_for_view_wrapper(view, traj, Bsel, policy_tag=name)
             if curr_x is None or not series: continue
-            if x_time is None: x_time = curr_x
-            if master_x_time is None: master_x_time = x_time
+            if x_time is None: 
+                x_time = curr_x
+                if master_x_time is None:
+                    master_x_time = x_time
             
             for s, lab in zip(series, labels):
                 if lab not in series_map: series_map[lab] = {}
@@ -371,5 +425,13 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
                         
     if master_x_time is not None and all_views_data:
         _save_series_to_csv(master_x_time, all_views_data, os.path.join(outdir, "traj_comparison_data.csv"))
+        
+    # --- (신규 추가) 모든 데이터를 저장하는 로직 호출 ---
+    _save_full_trajectories_to_csv(
+        trajectories=trajectories,
+        schema=SCHEMA,
+        Bsel=Bsel,
+        out_path=os.path.join(outdir, "traj_full_data.csv")
+    )
         
     return outdir
