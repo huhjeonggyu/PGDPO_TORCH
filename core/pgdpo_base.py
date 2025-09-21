@@ -35,7 +35,6 @@ try:
 except Exception as e:
     raise RuntimeError(f"[pgdpo_base] Failed to import symbols from user_pgdpo_base: {e}")
 
-PGDPO_TRAJ_B  = int(os.getenv("PGDPO_TRAJ_B", 5))
 PREVIEW_COORDS = int(os.getenv("PGDPO_PREVIEW_COORDS", 3))
 
 def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
@@ -78,10 +77,12 @@ def run_common(
     train_kwargs: Optional[Dict[str, Any]] = None,
     rmse_kwargs: Optional[Dict[str, Any]] = None,
 ) -> None:
-    set_global_seeds(int(seed_train) if seed_train is not None else int(default_seed))
+    effective_seed = int(seed_train) if seed_train is not None else int(default_seed)
+    set_global_seeds(effective_seed)
     train_kwargs = train_kwargs or {}
-    rmse_kwargs = rmse_kwargs or {}
+    train_kwargs['seed_train'] = effective_seed
 
+    rmse_kwargs = rmse_kwargs or {}
     policy = train_fn(**train_kwargs)
     policy_for_comparison = None
 
@@ -107,7 +108,6 @@ def run_common(
         saved = generate_and_save_trajectories(
             policy_learn=policy,
             policy_cf=policy_for_comparison,
-            B=PGDPO_TRAJ_B,
             seed_crn=int(CRN_SEED_EU),
             outdir=rmse_kwargs.get("outdir", None),
         )

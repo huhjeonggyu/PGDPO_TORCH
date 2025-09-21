@@ -254,10 +254,6 @@ class DirectPolicy(nn.Module):
         logits = self.net(x_in)                 # (B, d)
         u = F.softplus(logits)                  # (B, d), u >= 0 (공매도 금지)
 
-        # 필요하면 상한 도입 (부드러운 상한을 원하면 sigmoid*cap로 바꿀 수 있음)
-        if self.use_cap and torch.isfinite(torch.tensor(u_cap)):
-            u = torch.clamp(u, max=float(u_cap))
-
         return u
 
 def sample_initial_states(B: int, *, rng: torch.Generator | None = None):

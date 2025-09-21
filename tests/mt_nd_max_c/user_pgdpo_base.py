@@ -97,7 +97,7 @@ class WrappedCFPolicy(nn.Module):
 
 def build_closed_form_policy():
     u_star = (1.0 / gamma) * (Sigma_inv @ alpha)
-    theta_sq = (alpha.T @ Sigma_inv @ alpha).item()
+    theta_sq = (alpha.view(1, -1) @ Sigma_inv @ alpha.view(-1, 1)).item()
     m_star = (rho - (1 - gamma) * (r + theta_sq / (2 * gamma))) / gamma
     print(f"✅ Analytical policy computed: m*={m_star:.4f}, C_abs_cap={C_abs_cap:.4f}")
     return WrappedCFPolicy(u_star.to(device), C_abs_cap, m_star).to(device), None

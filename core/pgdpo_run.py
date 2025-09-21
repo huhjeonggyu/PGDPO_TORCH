@@ -87,131 +87,182 @@ def _divisors_desc(n: int):
 
 @torch.no_grad()
 def print_policy_rmse_and_samples_run(
-    pol_s1: nn.Module,
-    pol_cf: nn.Module | None,
+    policy_learn,
+    policy_for_comparison,
     *,
-    repeats: int,
-    sub_batch: int,
-    seed_eval: int | None = None,
-    outdir: str | None = None,
-    tile: int | None = None,
-    enable_pp: bool = True,
-    prefix: str = "run",
-    needs: Iterable[str] = ("JX", "JXX", "JXY"),
-) -> None:
-    gen = make_generator(seed_eval or CRN_SEED_EU)
-    states_dict, _ = sample_initial_states(N_eval_states, rng=gen)
-    u_learn_full = pol_s1(**states_dict)
-    
-    u_pp_run = None
-    if enable_pp:
-        valid_states = [v for v in states_dict.values() if v is not None]
-        if not valid_states:
-            raise ValueError("Cannot determine batch size because all states are None.")
-        B = valid_states[0].size(0)
+    repeats,
+    sub_batch,
+    seed_eval=None,
+    needs=("JX", "JXX"),
+    outdir=None,
+    **kwargs,
+):
+    """
+    Variance-Reduced RUN 경로에서 u_pp(run)과 닫힌형을 비교해 RMSE/프리뷰를 출력.
+    (소비 C 포함/미포함 자동 처리, tests/<model>/user_pgdpo_base.py에
+     make_eval_states가 없으면 기본 평가셋을 내부에서 생성)
+    """
+    import os, torch
+    import torch.nn.functional as F
 
-        divisors = _divisors_desc(B)
-        start_idx = next((i for i, d in enumerate(divisors) if d <= (tile or B)), 0)
-        u_pp_run_calc = torch.empty(B, d, device=u_learn_full.device)
-        for idx in range(start_idx, len(divisors)):
-            cur_tile = divisors[idx]
-            try:
-                for s in range(0, B, cur_tile):
-                    e = min(B, s + cur_tile)
-                    tile_states = {k: v[s:e] for k, v in states_dict.items() if v is not None}
-                    u_pp_run_calc[s:e] = ppgdpo_u_run(pol_s1, tile_states, repeats, sub_batch, seed_eval=(seed_eval if seed_eval is not None else 0), needs=tuple(needs))
-                u_pp_run = u_pp_run_calc
-                break
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-                    if idx + 1 < len(divisors): print(f"[Eval] OOM; reducing tile -> {divisors[idx+1]}"); continue
-                    else: print("[Eval] OOM; could not reduce tile further."); raise
-                else: raise
+    # ---------- 유틸 ----------
+    def _align_cols(t: torch.Tensor, target_cols: int) -> torch.Tensor:
+        if t.shape[1] == target_cols:
+            return t
+        if t.shape[1] > target_cols:
+            return t[:, :target_cols]
+        pad = torch.zeros(t.shape[0], target_cols - t.shape[1], device=t.device, dtype=t.dtype)
+        return torch.cat([t, pad], dim=1)
 
-    u_cf_full = pol_cf(**states_dict) if pol_cf is not None else None
+    def _infer_asset_dim(states: dict, d_out_guess: int) -> int:
+        if "alpha" in states:
+            a = states["alpha"]
+            if a.dim() == 1:
+                return int(a.shape[0])
+            if a.dim() >= 2:
+                return int(a.shape[-1])
+        if "Sigma" in states:
+            S = states["Sigma"]
+            if S.dim() == 2:
+                return int(S.shape[-1])
+            if S.dim() == 3:
+                return int(S.shape[-1])
+        return int(d_out_guess)
 
-    is_consumption_model = u_learn_full.size(1) > d
-    
-    u_learn, c_learn = (u_learn_full[:, :d], u_learn_full[:, d:]) if is_consumption_model else (u_learn_full, None)
-    u_pp, c_pp = (u_pp_run, c_learn) if u_pp_run is not None else (None, None)
-    u_cf, c_cf = (None, None)
-    if u_cf_full is not None:
-        u_cf, c_cf = (u_cf_full[:, :d], u_cf_full[:, d:]) if is_consumption_model else (u_cf_full, None)
+    def _vec_head(name: str, V: torch.Tensor, i: int, k: int) -> str:
+        k = min(k, V.shape[1])
+        return ", ".join(f"{name}[{j}]={float(V[i, j]):.4f}" for j in range(k))
 
-    # --- (핵심 수정) RMSE 출력 및 메트릭 저장 (투자 u와 소비 c 모두) ---
-    if u_cf is not None:
-        # 투자(u) RMSE
-        rmse_learn_u = torch.sqrt(((u_learn - u_cf) ** 2).mean()).item()
-        print(f"[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_learn_u:.6f}")
-        
-        metrics = {f"rmse_learn_cf_u_{prefix}": rmse_learn_u}
+    def _default_make_eval_states(device, N=100):
+        # k=0 계열도 동작하도록 X, TmT만 생성 (범위는 넉넉히)
+        X   = torch.linspace(0.2, 2.5, N, device=device).view(N, 1)
+        TmT = torch.linspace(0.0, 1.5, N, device=device).view(N, 1)
+        return {"X": X, "TmT": TmT}
 
-        if enable_pp and (u_pp is not None):
-            rmse_pp_u = torch.sqrt(((u_pp - u_cf) ** 2).mean()).item()
-            print(f"[Policy RMSE-PP (u)] ||u_pp({prefix}) - u_closed-form||_RMSE: {rmse_pp_u:.6f}")
-            metrics[f"rmse_pp_cf_u_{prefix}"] = rmse_pp_u
+    # ---------- 평가 상태 생성 ----------
+    device = next(policy_learn.parameters()).device
+    try:
+        from user_pgdpo_base import make_eval_states as _make_eval_states
+        eval_states = _make_eval_states(device)
+    except Exception:
+        N_eval = int(os.getenv("PGDPO_EVAL_N", "100"))
+        eval_states = _default_make_eval_states(device, N=N_eval)
 
-        # 소비(c) RMSE (소비 모델인 경우에만)
-        if is_consumption_model and c_cf is not None:
-            rmse_learn_c = torch.sqrt(((c_learn - c_cf) ** 2).mean()).item()
-            print(f"[Policy RMSE (C)] ||c_learn - c_closed-form||_RMSE: {rmse_learn_c:.6f}")
-            metrics[f"rmse_learn_cf_c_{prefix}"] = rmse_learn_c
+    N_eval = int(eval_states["X"].shape[0])
 
-            # P-PGDPO의 소비는 learn의 소비를 따르므로, c_pp vs c_cf RMSE도 계산
-            if c_pp is not None:
-                rmse_pp_c = torch.sqrt(((c_pp - c_cf) ** 2).mean()).item()
-                print(f"[Policy RMSE-PP (C)] ||c_pp({prefix}) - c_closed-form||_RMSE: {rmse_pp_c:.6f}")
-                metrics[f"rmse_pp_cf_c_{prefix}"] = rmse_pp_c
-        
-        if outdir is not None:
-            append_metrics_csv(metrics, outdir)
+    # ---------- 출력 차원 탐지 ----------
+    with torch.no_grad():
+        probe = {k: v[:1] for k, v in eval_states.items()}
+        try:
+            d_out = int(policy_for_comparison(**probe).shape[1])
+        except Exception:
+            d_out = int(policy_learn(**probe).shape[1])
+
+    # ---------- u_pp(run) 계산(청크 처리) ----------
+    CHUNK = int(os.getenv("PGDPO_EVAL_CHUNK", "100"))
+    u_pp_run_calc = torch.empty((N_eval, d_out), device=device)
+    pol_s1 = policy_learn
+    seval = (seed_eval if seed_eval is not None else 0)
+
+    for s in range(0, N_eval, CHUNK):
+        e = min(s + CHUNK, N_eval)
+        tile_states = {k: v[s:e] for k, v in eval_states.items()}
+        out = ppgdpo_u_run(
+            pol_s1,
+            tile_states,
+            repeats,
+            sub_batch,
+            seed_eval=seval,
+            needs=tuple(needs),
+        )
+        u_pp_run_calc[s:e] = _align_cols(out, d_out)
+
+    # ---------- 학습/닫힌형 ----------
+    with torch.no_grad():
+        u_learn = _align_cols(policy_learn(**eval_states).detach(), d_out)
+        u_cf    = _align_cols(policy_for_comparison(**eval_states).detach(), d_out)
+
+    # ---------- 소비 포함 여부 판정 (robust) ----------
+    # 1) tests/<model>/user_pgdpo_base.py의 alpha 길이로 d 힌트 확보
+    d_asset_hint = None
+    try:
+        from user_pgdpo_base import alpha as _ALPHA_HINT
+        d_asset_hint = int(_ALPHA_HINT.numel())
+    except Exception:
+        pass
+
+    # 2) 환경변수로 강제 지정 가능 (0/1)
+    env_has_c = os.getenv("PGDPO_HAS_CONSUMPTION", "")
+
+    if env_has_c != "":
+        has_consumption = (env_has_c != "0")
+        d_asset = (d_out - 1) if has_consumption else d_out
     else:
-        print("[INFO] No closed-form policy provided for comparison.")
+        d_asset = d_asset_hint if d_asset_hint is not None else _infer_asset_dim(eval_states, d_out)
+        # d_out이 d 또는 d+1 중 하나라고 가정
+        has_consumption = (d_out == d_asset + 1) or (d_out > d_asset and d_asset >= 1)
 
-    # --- (이하 샘플 프리뷰 및 그림 저장은 이전과 동일) ---
-    if VERBOSE:
-        n = min(SAMPLE_PREVIEW_N, u_learn.size(0))
-        print("\n--- Sample Previews ---")
-        for i in range(n):
-            parts, vec = [], False
-            for k_, v in states_dict.items():
-                if v is None: continue
-                ts = v[i]
-                if ts.numel() > 1:
-                    parts.append(f"{k_}[0]={ts[0].item():.3f}"); vec = True
-                else:
-                    parts.append(f"{k_}={ts.item():.3f}")
-            if vec: parts.append("...")
-            sstr = ", ".join(parts)
-    
-            msg_parts = [f"({sstr}) -> ("]
-            msg_parts.append(_fmt_coords('u_learn', u_learn, i, PREVIEW_COORDS))
-            if c_learn is not None: msg_parts.append(f", c_learn={c_learn[i].item():.4f}")
+    # ---------- RMSE ----------
+    if has_consumption and d_asset >= 1 and d_out >= d_asset + 1:
+        d = d_asset
+        rmse_u     = F.mse_loss(u_learn[:, :d],       u_cf[:, :d]).sqrt().item()
+        rmse_pp_u  = F.mse_loss(u_pp_run_calc[:, :d], u_cf[:, :d]).sqrt().item()
+        rmse_c     = F.mse_loss(u_learn[:, d:],       u_cf[:, d:]).sqrt().item()
+        rmse_pp_c  = F.mse_loss(u_pp_run_calc[:, d:], u_cf[:, d:]).sqrt().item()
+        print(f"[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_u:.6f}")
+        print(f"[Policy RMSE (C)] ||c_learn - c_closed-form||_RMSE: {rmse_c:.6f}")
+        print(f"[Policy RMSE-PP (u)] ||u_pp(run) - u_closed-form||_RMSE: {rmse_pp_u:.6f}")
+        print(f"[Policy RMSE-PP (C)] ||c_pp(run) - c_closed-form||_RMSE: {rmse_pp_c:.6f}")
+    else:
+        rmse_u    = F.mse_loss(u_learn,       u_cf).sqrt().item()
+        rmse_pp_u = F.mse_loss(u_pp_run_calc, u_cf).sqrt().item()
+        print(f"[Policy RMSE (u)] ||u_learn - u_closed-form||_RMSE: {rmse_u:.6f}")
+        print(f"[Policy RMSE-PP (u)] ||u_pp(run) - u_closed-form||_RMSE: {rmse_pp_u:.6f}")
 
-            if u_pp is not None:
-                msg_parts.append(", " + _fmt_coords(f'u_pp({prefix})', u_pp, i, PREVIEW_COORDS))
+    # ---------- 샘플 프리뷰 ----------
+    PREVIEW_ROWS   = int(os.getenv("PGDPO_PREVIEW_ROWS", "3"))
+    PREVIEW_COORDS = int(os.getenv("PGDPO_PREVIEW_COORDS", "3"))
 
-            if u_cf is not None:
-                msg_parts.append(", " + _fmt_coords('u_cf', u_cf, i, PREVIEW_COORDS))
-                if c_cf is not None: msg_parts.append(f", c_cf={c_cf[i].item():.4f}")
-            
-            msg_parts.append(")")
-            print("".join(msg_parts))
+    print("\n--- Sample Previews ---")
+    rows = min(PREVIEW_ROWS, N_eval)
+    for i in range(rows):
+        bits = []
+        if "X" in eval_states:
+            try: bits.append(f"X={float(eval_states['X'][i]):.3f}")
+            except: pass
+        if "TmT" in eval_states:
+            try: bits.append(f"TmT={float(eval_states['TmT'][i]):.3f}")
+            except: pass
+        if "Y" in eval_states:
+            try:
+                Y = eval_states["Y"]
+                if Y.dim() >= 2 and Y.shape[1] > 0:
+                    bits.append(f"Y[0]={float(Y[i,0]):.3f}")
+            except: pass
+        prefix = "  (" + ", ".join(bits) + ") -> "
 
-    if outdir is not None:
-        save_overlaid_delta_hists(u_learn=u_learn, u_pp=u_pp, u_cf=u_cf, outdir=outdir, coord=0, fname=f"delta_u_{prefix}_overlaid_hist.png", bins=60)
-        if u_cf is not None:
-            save_combined_scatter(
-                u_ref=u_cf, u_learn=u_learn, u_pp=u_pp,
-                outdir=outdir, coord=0, fname=f"scatter_u_{prefix}_comparison.png"
+        if has_consumption and d_asset >= 1 and d_out >= d_asset + 1:
+            d = d_asset
+            k = min(PREVIEW_COORDS, d)
+            line = (
+                f"{_vec_head('u_learn', u_learn, i, k)}, "
+                f"c_learn={float(u_learn[i, d]):.4f}, "
+                f"{_vec_head('u_pp(run)', u_pp_run_calc, i, k)}, "
+                f"c_pp={float(u_pp_run_calc[i, d]):.4f}, "
+                f"{_vec_head('u_cf', u_cf, i, k)}, "
+                f"c_cf={float(u_cf[i, d]):.4f}"
             )
-        if is_consumption_model and c_learn is not None and c_cf is not None:
-             save_combined_scatter(
-                u_ref=c_cf, u_learn=c_learn, u_pp=c_pp,
-                outdir=outdir, coord=0, fname=f"scatter_c_{prefix}_comparison.png",
-                xlabel="c_closed-form", title="Consumption Comparison"
+        else:
+            k = min(PREVIEW_COORDS, d_out)
+            line = (
+                f"{_vec_head('u_learn', u_learn, i, k)}, "
+                f"{_vec_head('u_pp(run)', u_pp_run_calc, i, k)}, "
+                f"{_vec_head('u_cf', u_cf, i, k)}"
             )
+        print(prefix + "(" + line + ")")
+
+
+
 
 # ------------------------------------------------------------
 # 학습 루프 (변경 없음)

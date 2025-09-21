@@ -21,8 +21,9 @@ from pgdpo_base import (
     sample_initial_states, simulate,
 )
 
+PGDPO_TRAJ_B  = int(os.getenv("PGDPO_TRAJ_B", 1))
 PGDPO_CURRENT_MODE = os.getenv("PGDPO_CURRENT_MODE", "unknown")
-PP_MODE = os.getenv('PP_MODE','runner').lower()
+PP_MODE = os.getenv('PP_MODE','direct').lower()
 _HAS_RUNNER, _HAS_DIRECT = False, False
 try: from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
 except ImportError: pass
@@ -79,7 +80,7 @@ class PPDirectPolicy(nn.Module):
         if not _HAS_DIRECT: raise RuntimeError("'direct' utilities not available.")
         
         # 1. P-PGDPO로 투자(u)만 프로젝션
-        u_projected = ppgdpo_u_direct(self.stage1_policy, states_dict, REPEATS_DIR, SUBBATCH_DIR, self.seed)
+        u_projected = ppgdpo_u_direct(self.stage1_policy, states_dict, repeats=REPEATS_DIR, sub_batch=SUBBATCH_DIR, seed_eval=self.seed)
 
         # 2. 원본 정책의 전체 출력을 확인하여 소비 모델인지 판별
         with torch.no_grad():
@@ -389,8 +390,8 @@ def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = 
     plt.close(fig)
 
 @torch.no_grad()
-def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[nn.Module] = None, outdir: Optional[str] = None, B: Optional[int] = None, seed_crn: Optional[int] = None) -> str:
-    outdir = _ensure_outdir(outdir); B_all = int(B or N_eval_states); seed_crn = int(seed_crn or CRN_SEED_EU)
+def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[nn.Module] = None, outdir: Optional[str] = None, seed_crn: Optional[int] = None) -> str:
+    outdir = _ensure_outdir(outdir); B_all = int(PGDPO_TRAJ_B or N_eval_states); seed_crn = int(seed_crn or CRN_SEED_EU)
     def _g(): return torch.Generator(device=device).manual_seed(seed_crn)
     
     print("[traj] Simulating trajectories for 'learn' policy...")

@@ -42,7 +42,7 @@ def _fmt_coords(label: str, mat: torch.Tensor, i: int, k: int) -> str:
     return (", ".join(parts)) + (", ..." if n > K else "")
 
 REPEATS  = int(os.getenv("PGDPO_PP_REPEATS", 2560*d))
-SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 2560))
+SUBBATCH = int(os.getenv("PGDPO_PP_SUBBATCH", 256))
 VERBOSE            = os.getenv("PGDPO_VERBOSE", "1") == "1"
 SAMPLE_PREVIEW_N   = int(os.getenv("PGDPO_SAMPLE_PREVIEW_N", 3))
 
