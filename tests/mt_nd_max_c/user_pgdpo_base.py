@@ -1,5 +1,5 @@
 # 파일: tests/mt_nd_max_c/user_pgdpo_base.py
-# 모델: 소비 상한 모델 (신경망이 소비 비율을 학습) - 최종 버전
+# 모델: 소비 상한 모델 (소비 비율 + 투자 비율 모두 학습 가능; U_MODE 토글) - 상대 상한 버전
 
 import os
 import math
@@ -7,24 +7,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------------------------- 기본 설정 (변경 없음) ---------------------------
+# --------------------------- 기본 설정 ---------------------------
 d = int(os.getenv("PGDPO_D", 5)); k = 0
 epochs = int(os.getenv("PGDPO_EPOCHS", 200)); batch_size = int(os.getenv("PGDPO_BS", 1024))
-lr = float(os.getenv("PGDPO_LR", 1e-5)); seed = int(os.getenv("PGDPO_SEED", 24))
+lr = float(os.getenv("PGDPO_LR", 1e-4)); seed = int(os.getenv("PGDPO_SEED", 24))
 T = float(os.getenv("PGDPO_T", 1.5)); m = int(os.getenv("PGDPO_M", 20))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DIM_X = 1; DIM_Y = k; DIM_U = d + 1
 N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100)); CRN_SEED_EU = int(os.getenv("PGDPO_CRN", 1352))
 
-# --------------------------- 경제 파라미터 (변경 없음) ---------------------------
-gamma = float(os.getenv("PGDPO_GAMMA", 2.0)); rho   = float(os.getenv("PGDPO_RHO", 0.10))
-r     = float(os.getenv("PGDPO_RF", 0.03)); kappa = float(os.getenv("PGDPO_KAPPA", 1.0))
-C_abs_cap = float(os.getenv("PGDPO_C_CAP", 1.0))
-L_cap = float(os.getenv("PGDPO_LCAP", 3.0))
+# --------------------------- 경제 파라미터 ---------------------------
+gamma = float(os.getenv("PGDPO_GAMMA", 2.0))
+rho   = float(os.getenv("PGDPO_RHO", 0.10))
+r     = float(os.getenv("PGDPO_RF", 0.03))
+kappa = float(os.getenv("PGDPO_KAPPA", 1.0))
+
+# 상대(부 비례) 소비 상한: C_max(X) = c_frac * X
+c_frac    = float(os.getenv("PGDPO_C_FRAC", 0.7))
+L_cap     = float(os.getenv("PGDPO_LCAP", 3.0))   # u 안정화를 위한 소프트 박스
+
 X0_range = (0.1, 3.0); lb_X = 1e-6
 
-# --------------------------- 시장 파라미터 생성 (변경 없음) ---------------------------
+# --------------------------- 시장 파라미터 생성 ---------------------------
 @torch.no_grad()
 def _nearest_spd_correlation(C: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     C = 0.5 * (C + C.T); evals, evecs = torch.linalg.eigh(C)
@@ -43,14 +48,17 @@ def _generate_mu_sigma_balanced(
     sigma = torch.empty(d, device=dev).uniform_(*vol_range)
     Psi = torch.full((d, d), float(avg_corr), device=dev); Psi.fill_diagonal_(1.0)
     if jitter > 0:
-        N = torch.randn(d, d, device=dev) * jitter; Psi = _nearest_spd_correlation(Psi + 0.5 * (N + N.T))
+        N = torch.randn(d, d, device=dev) * jitter
+        Psi = _nearest_spd_correlation(Psi + 0.5 * (N + N.T))
     Sigma = torch.diag(sigma) @ Psi @ torch.diag(sigma)
     Sigma = Sigma + lam_factor * Sigma.diag().mean() * torch.eye(d, device=dev)
     w_ref = torch.distributions.Dirichlet(torch.full((d,), float(dirichlet_conc))).sample().to(dev)
     if (w_ref**2).sum() > (hhi_factor / d):
         w_ref = (0.6 * w_ref) + 0.4 * (torch.ones(d, device=dev) / d)
-    if target_leverage is not None: s = float(target_leverage)
-    else: s = float(alpha_mid / (gamma * (Sigma @ w_ref).mean().clamp_min(1e-8)).item())
+    if target_leverage is not None:
+        s = float(target_leverage)
+    else:
+        s = float(alpha_mid / (gamma * (Sigma @ w_ref).mean().clamp_min(1e-8)).item())
     alpha = gamma * s * (Sigma @ w_ref)
     if noise_std > 0:
         alpha += float(noise_std) * alpha.abs().mean() * torch.randn_like(alpha)
@@ -59,43 +67,60 @@ def _generate_mu_sigma_balanced(
     return {"alpha": alpha, "Sigma": Sigma, "Sigma_inv": Sigma_inv}
 
 params = _generate_mu_sigma_balanced(
-    d, device, seed=seed, target_leverage=L_cap,
+    d, device, seed=seed, target_leverage=None,
     dirichlet_conc=10.0, hhi_factor=3.0
 )
 alpha, Sigma, Sigma_inv = params["alpha"], params["Sigma"], params["Sigma_inv"]
 chol_S = torch.linalg.cholesky(Sigma)
 
+# --------------------------- U 학습 모드 토글 ---------------------------
+U_MODE = os.getenv("PGDPO_U_MODE", "free")       # "free" | "residual" | "const"
+U_RESID_SCALE = float(os.getenv("PGDPO_U_RESID_SCALE", "0.2"))
+U_CLAMP = float(os.getenv("PGDPO_U_CLAMP", str(L_cap)))  # 마지막 안전 클램프 범위
+
 # --------------------------- 유틸 및 정책 ---------------------------
 
 class DirectPolicy(nn.Module):
+    """
+    신경망이 '소비 비율'과 '투자 비율'을 학습.
+      - 소비: C = c_frac * X * sigmoid(f(X, TmT))
+      - 투자:
+          U_MODE="const"    : u = u_Merton (상수)
+          U_MODE="residual" : u = u_Merton + s * tanh(g(X, TmT))
+          U_MODE="free"     : u = L_cap * tanh(g(X, TmT))
+    """
     def __init__(self):
         super().__init__()
-        state_dim = DIM_X + DIM_Y + 1
+        state_dim = DIM_X + DIM_Y + 1  # X, TmT
         hid = 200
         self.consumption_net = nn.Sequential(
             nn.Linear(state_dim, hid), nn.LeakyReLU(),
             nn.Linear(hid, hid), nn.LeakyReLU(),
             nn.Linear(hid, 1)
         )
-        self.investment_net  = nn.Sequential(
-            nn.Linear(state_dim, hid), nn.LeakyReLU(),
-            nn.Linear(hid, hid), nn.LeakyReLU(),
-            nn.Linear(hid, d)
-        )
-        self.two_stage = True
+        # 머튼 상수 벡터
+        u_star = (1.0 / gamma) * (Sigma_inv @ alpha)  # (d,)
+        self.register_buffer("u_const", u_star)
+
+        if U_MODE in {"residual", "free"}:
+            self.investment_net = nn.Sequential(
+                nn.Linear(state_dim, hid), nn.LeakyReLU(),
+                nn.Linear(hid, hid), nn.LeakyReLU(),
+                nn.Linear(hid, d)
+            )
+        self.two_stage = True  # 코어 호환용
 
     def forward_consumption(self, **states_dict):
-        z = torch.cat([states_dict["X"], states_dict["TmT"]], dim=1)
-        #ratio = torch.sigmoid(self.consumption_net(z))
-        #C_prop = states_dict["X"] * ratio #* states_dict["TmT"]
-        #C = torch.minimum(C_prop, torch.full_like(C_prop, C_abs_cap))
-        C = C_abs_cap*torch.sigmoid(self.consumption_net(z))
+        z = torch.cat([states_dict["X"], states_dict["TmT"]], dim=1)  # (B,2)
+        ratio = torch.sigmoid(self.consumption_net(z))                 # (B,1) ∈ (0,1)
+        C = c_frac * states_dict["X"] * ratio                          # 상대 상한
         return C
 
     def forward_investment(self, **states_dict):
+        B = states_dict["X"].shape[0]
         z_inv = torch.cat([states_dict["X"], states_dict["TmT"]], dim=1)
         u_raw = self.investment_net(z_inv)
-        u = L_cap * torch.tanh(u_raw)
+        u = U_CLAMP * torch.tanh(u_raw)
         return u
 
     def forward(self, **states_dict):
@@ -104,44 +129,39 @@ class DirectPolicy(nn.Module):
         return torch.cat([u, C], dim=1)
 
 class WrappedCFPolicy(nn.Module):
-    def __init__(self, u_star, c_cap_abs, gamma, r, rho, theta_sq, kappa, T):
+    """
+    해석적 참조정책(상대 상한 유지):
+      u_cf = (1/gamma) Σ^{-1} α  (상수)
+      C_cf(t,X) = min{ m(t), c_frac } * X
+    """
+    def __init__(self, u_star, c_frac, gamma, r, rho, theta_sq, kappa, T):
         super().__init__()
         self.register_buffer("u_star", u_star)  # (d,)
-        self.c_cap_abs = float(c_cap_abs)
+        self.c_frac = float(c_frac)
         self.gamma = float(gamma); self.r = float(r); self.rho = float(rho)
         self.theta_sq = float(theta_sq); self.kappa = float(kappa); self.T = float(T)
-
-        # 무한지평 평형값 m*
         self.m_star = ( self.rho - (1.0 - self.gamma) * ( self.r + self.theta_sq / (2.0 * self.gamma) ) ) / self.gamma
-        # 종결 경계 m(T)
         self.m_T = (self.kappa if self.kappa > 0.0 else 1e-12) ** (-1.0 / self.gamma)
 
     def forward(self, **states_dict):
         X  = states_dict["X"]           # (B,1)
         tau = states_dict["TmT"]        # (B,1)  남은시간 = T - t
-
-        # m(t) = m* / [ 1 + (m*/m_T - 1) * exp(-m* * (T - t)) ]  ;  (T - t) = tau
         m_star = torch.tensor(self.m_star, device=X.device, dtype=X.dtype)
         m_T    = torch.tensor(self.m_T,    device=X.device, dtype=X.dtype)
-        denom  = 1.0 + (m_star / m_T - 1.0) * torch.exp( - m_star * tau )
-        m_t    = (m_star / denom).clamp_min(1e-12)   # 안전 하한
-
-        # 소비와 포트폴리오
-        C = torch.minimum(m_t * X, torch.full_like(X, self.c_cap_abs))
+        denom  = 1.0 + (m_star / m_T - 1.0) * torch.exp(-m_star * tau)
+        m_t    = (m_star / denom).clamp_min(1e-12)                     # (B,1)
+        C = torch.minimum(m_t, torch.full_like(X, self.c_frac)) * X
         u = self.u_star.unsqueeze(0).expand(X.size(0), -1)
         return torch.cat([u, C], dim=1)
 
 def build_closed_form_policy():
-    # u*와 θ^2
     u_star = (1.0 / gamma) * (Sigma_inv @ alpha)
     theta_sq = (alpha.view(1, -1) @ Sigma_inv @ alpha.view(-1, 1)).item()
-    # 정보 출력은 m*가 아니라 유한지평 경계 포함 안내로 교체
-    print(f"✅ Finite-horizon CF policy: using time-varying m(t),  C_cap={C_abs_cap:.4f}")
+    print(f"✅ Finite-horizon CF policy: using time-varying m(t),  C_frac={c_frac:.4f}")
     pol = WrappedCFPolicy(
-        u_star.to(device), C_abs_cap, gamma, r, rho, theta_sq, kappa, T
+        u_star.to(device), c_frac, gamma, r, rho, theta_sq, kappa, T
     ).to(device)
     return pol, None
-
 
 # --------------------------- 초기 상태 및 시뮬레이터 ---------------------------
 def sample_initial_states(B, *, rng=None):
@@ -161,35 +181,41 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
         current_X = torch.exp(logX)
         cur_states = {"X": current_X, "TmT": TmT0 - i * dt}
 
+        # 1) 소비 결정
         out = policy(**cur_states)
         u, C = out[:, :d], out[:, d:]
-        C = torch.min(C, current_X)
+        C = torch.min(C, current_X)  # 수치 안전
 
-        uC = (C.clamp_min(1e-12).pow(1-gamma)-1)/(1-gamma) if gamma != 1.0 else torch.log(C.clamp_min(1e-12))
+        # 흐름효용
+        if gamma != 1.0:
+            uC = (C.clamp_min(1e-12).pow(1-gamma) - 1.0) / (1.0 - gamma)
+        else:
+            uC = torch.log(C.clamp_min(1e-12))
         util_cons += torch.exp(-rho * t_i) * uC * dt
 
+        # 2) 소비 차감 후 투자 적용
         current_X = current_X - C * dt
-        current_X = torch.max(torch.ones_like(current_X)*0.001, current_X)
+        current_X = torch.max(torch.ones_like(current_X) * 1e-3, current_X)
         cur_states = {"X": current_X, "TmT": TmT0 - i * dt}
-        
-
         out = policy(**cur_states)
-        u, C = out[:, :d], out[:, d:]
+        u, _ = out[:, :d], out[:, d:]
 
+        # 로그-부 진화
         drift = r + (u * alpha).sum(1, keepdim=True) \
-                  - 0.5 * (u.unsqueeze(1) @ Sigma @ u.unsqueeze(-1)).squeeze(-1) 
+                  - 0.5 * (u.unsqueeze(1) @ Sigma @ u.unsqueeze(-1)).squeeze(-1)
         dBX = (u @ chol_S * Z[:, i, :]).sum(1, keepdim=True)
         logX += drift * dt + dBX * dt.sqrt()
         current_X = torch.exp(logX)
-        current_X = torch.max(torch.ones_like(current_X)*0.001, current_X)
+        current_X = torch.max(torch.ones_like(current_X) * 1e-3, current_X)
         logX = torch.log(current_X)
-        
 
-    uT = (torch.exp(logX).pow(1-gamma)-1)/(1-gamma) if gamma != 1.0 else logX
-    
-    # ✨✨✨ 핵심 수정: --1을 -1로 변경 ✨✨✨
+    # 말기효용
+    if gamma != 1.0:
+        uT = (torch.exp(logX).pow(1-gamma) - 1.0) / (1.0 - gamma)
+    else:
+        uT = logX
+
     return (util_cons + kappa * math.exp(-rho * T) * uT).view(-1)
-
 
 def get_traj_schema():
     u_labels = [f"u_{i+1}" for i in range(d)] + ["Consumption"]
@@ -200,8 +226,5 @@ def get_traj_schema():
             {"name": "Wealth_Path", "block": "X", "mode": "indices", "indices": [0], "ylabel": "Wealth (X)"},
         ],
         "sampling": {"Bmax": 5},
-        "legend_labels": {
-            "cf": "Analytical Solution",
-            "learn": "Learned Policy"
-        }
+        "legend_labels": {"cf": "Analytical Solution", "learn": "Learned Policy"}
     }
