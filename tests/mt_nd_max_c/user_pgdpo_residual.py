@@ -13,12 +13,11 @@ from user_pgdpo_base import (
     gamma as GAMMA_CONST,
     rho as RHO_CONST,
     r as R_CONST,
-    # ✨ 수정: alpha_rel 대신 C_abs_cap를 import
-    C_abs_cap as C_ABS_CAP_CONST 
+    C_abs_cap as C_ABS_CAP_CONST
 )
 
 # 잔차 크기 스케일(코어가 import)
-ResCap = float(os.getenv("PGDPO_RES_CAP", 0.10))
+ResCap = float(os.getenv("PGDPO_RES_CAP", 0.50))
 
 class MyopicPolicy(nn.Module):
     """
@@ -33,7 +32,8 @@ class MyopicPolicy(nn.Module):
         self.register_buffer("u_star", u_star.view(-1))
 
         # 2. 기준 소비율 m* 계산
-        theta_sq = (ALPHA_CONST.T @ SIGMAi_CONST @ ALPHA_CONST).item()
+        # ✨✨✨ 핵심 수정: .T 대신 view를 사용하여 1D 텐서의 행렬 곱셈 수행 ✨✨✨
+        theta_sq = (ALPHA_CONST.view(1, -1) @ SIGMAi_CONST @ ALPHA_CONST.view(-1, 1)).item()
         gamma_val = float(GAMMA_CONST)
         rho_val = float(RHO_CONST)
         r_val = float(R_CONST)
@@ -51,7 +51,7 @@ class MyopicPolicy(nn.Module):
         # 1. 기준 투자 u_star 생성
         u = self.u_star.unsqueeze(0).expand(B, -1)
 
-        # 2. ✨ 수정: 기준 소비 C를 고정 상한(C_ABS_CAP_CONST)을 사용하여 계산
+        # 2. 기준 소비 C를 고정 상한(C_ABS_CAP_CONST)을 사용하여 계산
         C_prop = self.m_star * X
         C_cap  = torch.full_like(X, float(C_ABS_CAP_CONST))
         C = torch.minimum(C_prop, C_cap)
