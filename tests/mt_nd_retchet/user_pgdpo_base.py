@@ -3,6 +3,7 @@
 # 목적: 학습 베이스 + (코어 호환) 무인자 build_closed_form_policy() 제공
 #       - 학습 정책은 "소비 비율"을 예측 → C = max(Y, ĉ·X)
 #       - 환경에서 랫칫팅을 한 번 더 강제 (집행 C = max(C_pred, Y))
+#       - (보완) 집행 C 기준 재량부 비율(1 - PV(C)/X)로 위험노출을 선택적으로 스케일
 
 from __future__ import annotations
 import os, math, torch
@@ -48,6 +49,10 @@ L_cap = float(os.getenv("PGDPO_LCAP", 1.0))
 
 # 학습 정책의 소비 비율 상한 (연율)
 C_RATE_MAX = float(os.getenv("PGDPO_C_RATE_MAX", "2.0"))  # 예: 2.0/year
+
+# 재량부 스케일 사용 여부(시뮬레이터에서 집행 C 기준으로 스케일)
+SCALE_BY_DW = bool(int(os.getenv("PGDPO_SCALE_BY_DW", "1")))
+DW_FLOOR = float(os.getenv("PGDPO_DW_FLOOR", "0.0"))
 
 # --------------------------- 시장 파라미터 ---------------------------
 @torch.no_grad()
@@ -101,6 +106,12 @@ params = _generate_mu_sigma_balanced(
 alpha, Sigma, Sigma_inv = params["alpha"], params["Sigma"], params["Sigma_inv"]
 chol_S = torch.linalg.cholesky(Sigma)
 
+# --------------------------- 유틸: 연금가 ---------------------------
+def _annuity_factor(r: float, tau_t: torch.Tensor) -> torch.Tensor:
+    if abs(r) < 1e-12:
+        return tau_t.clamp_min(1e-12)
+    return (1.0 - torch.exp(torch.tensor(-r, dtype=tau_t.dtype, device=tau_t.device) * tau_t)) / float(r)
+
 # --------------------------- 학습 정책 (소비 "비율") ---------------------------
 class DirectPolicy(nn.Module):
     def __init__(self):
@@ -149,7 +160,6 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     Z = random_draws[0] if random_draws is not None else torch.randn(B, m_eff, d, device=device, generator=rng)
     total_utility = torch.zeros((B, 1), device=device)
 
-    # (선택) 예산 집행 하드캡: 한 스텝에 전부 소비 못하게
     ENFORCE_BUDGET = bool(int(os.getenv("PGDPO_ENFORCE_BUDGET", "1")))
     CAP_MULT_STR = os.getenv("PGDPO_C_SOFTCAP", "None")
     CAP_MULT = None if CAP_MULT_STR == "None" else float(CAP_MULT_STR)
@@ -161,15 +171,20 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
         out = policy(**{'X': torch.cat([wealth, habit], dim=1), 'TmT': tau})
         u, C_pred = out[:, :d], out[:, d:]
 
-        # 2) 래칫 강제 (C는 비감소)
+        # 2) 래칫 강제 (C는 비감소) 및 실행 제약
         C = torch.maximum(C_pred, habit)
-        # (선택) 소비 소프트캡: C ≤ max(Y, cap_mult*X)
         if CAP_MULT is not None:
             cap = torch.maximum(habit, CAP_MULT * wealth)
             C = torch.minimum(C, cap)
-        # (선택) 하드 예산: 한 스텝에 X보다 더 못쓴다 (cap 시나리오와 동일한 느낌)
         if ENFORCE_BUDGET:
             C = torch.minimum(C, wealth / dt.clamp_min(1e-12))
+
+        # 2.5) 재량부 스케일: λ_dw = max(0, 1 - PV(C)/X)
+        if SCALE_BY_DW:
+            pvC = _annuity_factor(r, tau) * C
+            dw_share = (wealth - pvC) / wealth.clamp_min(1e-12)
+            dw_share = torch.clamp(dw_share, min=DW_FLOOR, max=1.0)
+            u = u * dw_share
 
         # 3) 소비 선차감 → 투자 가능한 현금
         investable = torch.clamp(wealth - C * dt, min=lb_X)
@@ -199,18 +214,17 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     total_utility += torch.exp(torch.tensor(-rho * T, device=device)) * kappa * terminal_utility
     return total_utility.view(-1)
 
-
-
 # --------------------------- (코어 호환) 무인자 CF 빌더 ---------------------------
 ALPHA_RAISE = float(os.getenv("PGDPO_ALPHA_RAISE", "0.9"))  # BW 기준정책의 부분 상승 정도
 C_SOFTCAP   = os.getenv("PGDPO_C_SOFTCAP", "None")
 C_SOFTCAP   = None if C_SOFTCAP == "None" else float(C_SOFTCAP)
+DW_FLOOR_CF = float(os.getenv("PGDPO_DW_FLOOR_CF", "0.0"))
 
 def build_closed_form_policy():
     return build_cf_with_args(
         alpha=alpha, Sigma=Sigma, gamma=gamma, L_cap=L_cap,
         rho=rho, r=r, T=T, rim_steps=RIM_STEPS, device=device,
-        alpha_raise=ALPHA_RAISE, c_softcap=C_SOFTCAP
+        alpha_raise=ALPHA_RAISE, c_softcap=C_SOFTCAP, dw_floor=DW_FLOOR_CF
     )
 
 # (선택) 프리로드

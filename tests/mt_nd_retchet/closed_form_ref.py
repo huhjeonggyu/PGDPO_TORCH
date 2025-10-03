@@ -8,6 +8,7 @@
 #  - R*_τ = 1/(1 - n_-(τ)),  n_-(τ)는 θ^2/2·n^2 + ((ρ-r) - 0.5θ^2)·n - ρ(1 - e^{-ρτ}) = 0 의 음의 해
 #  - X_ap(τ,c) = [γ/(γ - R*_τ)] · c · (1 - e^{-rτ}) / r   (r≈0이면 분모를 τ로 대체)
 #  - X > X_ap(τ,c) 일 때만 c를 경계로 상향(랫칭: C≥Y).
+#  - 포트폴리오 위험노출은 재량부 비율 (1 - PV(c)/X) 로 스케일.
 
 from __future__ import annotations
 import math
@@ -36,11 +37,10 @@ def solve_static_portfolio(alpha: torch.Tensor,
         u_pos = u_pos * (L_cap / s)
     return u_pos
 
-
 # ----------------------- BW 근사 보조 함수 ----------------------- #
 def _Rstar_tau(theta: float, rho: float, r: float, tau: float) -> float:
     """
-    Proposition 4.1에서의 R*_τ.
+    Proposition 4.1의 R*_τ.
     θ = (μ-r)/σ (여기서는 유효 포트폴리오 θ_eff 사용)
     n_-은 (θ^2/2) n^2 + ((ρ-r) - 0.5 θ^2) n - ρ (1 - e^{-ρ τ}) = 0 의 음의 해.
     """
@@ -55,13 +55,11 @@ def _Rstar_tau(theta: float, rho: float, r: float, tau: float) -> float:
     n_minus = (-B - math.sqrt(disc)) / (2.0 * A)
     return 1.0 / (1.0 - n_minus)
 
-
 def _annuity_factor(r: float, tau_t: torch.Tensor) -> torch.Tensor:
     """ (1 - e^{-r τ})/r (r≈0이면 τ) """
     if abs(r) < 1e-12:
         return tau_t.clamp_min(1e-12)
     return (1.0 - torch.exp(torch.tensor(-r, dtype=tau_t.dtype, device=tau_t.device) * tau_t)) / float(r)
-
 
 def _X_threshold_BW(c: torch.Tensor, tau: torch.Tensor,
                     gamma: float, r: float, Rstar_tau: torch.Tensor) -> torch.Tensor:
@@ -70,7 +68,6 @@ def _X_threshold_BW(c: torch.Tensor, tau: torch.Tensor,
     """
     ratio = float(gamma) / torch.clamp(torch.tensor(gamma, dtype=c.dtype, device=c.device) - Rstar_tau, min=1e-6)
     return ratio * c * _annuity_factor(r, tau)
-
 
 def _solve_c_from_X_BW(X: torch.Tensor, tau: torch.Tensor,
                        gamma: float, r: float, Rstar_tau: torch.Tensor) -> torch.Tensor:
@@ -81,11 +78,10 @@ def _solve_c_from_X_BW(X: torch.Tensor, tau: torch.Tensor,
     factor = torch.clamp(torch.tensor(gamma, dtype=X.dtype, device=X.device) - Rstar_tau, min=1e-6) / float(gamma)
     return X * factor / torch.clamp(_annuity_factor(r, tau), min=1e-10)
 
-
 # ----------------------- 정책 클래스 (BW 근사 기반) ----------------------- #
 class TimeDependentRatchetPolicyBW(nn.Module):
     """
-    - 포트폴리오는 u* 고정.
+    - 포트폴리오는 u*를 기본으로 하되, 재량부 비율(1 - PV(c)/X)로 위험노출을 스케일.
     - 소비는 BW 근사 임계부 사용:
         X > X_ap(τ,c_current) 이면 c를 경계로 올림(부분 상승 허용), 아니면 유지.
     - 항상 C >= Y(=과거최대소비) 강제 -> 랫칭 보장.
@@ -98,7 +94,8 @@ class TimeDependentRatchetPolicyBW(nn.Module):
                  r: float, rho: float, T: float,
                  device: torch.device,
                  alpha_raise: float = 1.0,
-                 c_softcap: float | None = None):
+                 c_softcap: float | None = None,
+                 dw_floor: float = 0.0):
         super().__init__()
         self.register_buffer("u_star", u_star.to(device))
         self.theta_eff = float(theta_eff)
@@ -108,6 +105,7 @@ class TimeDependentRatchetPolicyBW(nn.Module):
         self.T = float(T)
         self.alpha_raise = float(alpha_raise)
         self.c_softcap = None if c_softcap is None else float(c_softcap)
+        self.dw_floor = float(max(0.0, dw_floor))
 
     def forward(self, **states_dict):
         X = states_dict["X"]                 # (B, 2) : [Wealth, Habit]
@@ -120,7 +118,7 @@ class TimeDependentRatchetPolicyBW(nn.Module):
 
         # 배치 R*_τ
         tau_np = tau.detach().cpu().numpy().reshape(-1)
-        Rstar_vals = [ _Rstar_tau(self.theta_eff, self.rho, self.r, float(max(0.0, t))) for t in tau_np ]
+        Rstar_vals = [_Rstar_tau(self.theta_eff, self.rho, self.r, float(max(0.0, t))) for t in tau_np]
         Rstar_tau = torch.tensor(Rstar_vals, dtype=wealth.dtype, device=wealth.device).view(-1, 1)
 
         # 임계부 통과 여부
@@ -137,9 +135,13 @@ class TimeDependentRatchetPolicyBW(nn.Module):
             cap = torch.maximum(habit, self.c_softcap * wealth)
             C = torch.minimum(C, cap)
 
-        u = self.u_star.unsqueeze(0).expand(wealth.size(0), -1)
-        return torch.cat([u, C], dim=1)
+        # 재량부 비율로 위험노출 스케일: λ_dw = max(0, 1 - PV(C)/X)
+        pvC = _annuity_factor(self.r, tau) * C
+        dw_share = (wealth - pvC) / wealth.clamp_min(1e-12)
+        dw_share = torch.clamp(dw_share, min=self.dw_floor, max=1.0)
 
+        u = self.u_star.unsqueeze(0).expand(wealth.size(0), -1) * dw_share
+        return torch.cat([u, C], dim=1)
 
 # ----------------------------- 외부 빌더 ----------------------------- #
 def build_cf_with_args(*,
@@ -150,7 +152,8 @@ def build_cf_with_args(*,
                        device: torch.device,
                        z_margin: float = 0.0,           # (미사용) 이전 z-기반과 호환
                        alpha_raise: float = 1.0,        # 부분 상승 계수
-                       c_softcap: float | None = None   # 소비 소프트캡 (배수)
+                       c_softcap: float | None = None,  # 소비 소프트캡 (배수)
+                       dw_floor: float = 0.0            # 재량부 스케일의 하한(옵션)
                        ):
     """
     외부 진입점:
@@ -168,11 +171,11 @@ def build_cf_with_args(*,
     policy = TimeDependentRatchetPolicyBW(
         u_star=u_star, theta_eff=theta_eff, gamma=gamma,
         r=r, rho=rho, T=T, device=device,
-        alpha_raise=alpha_raise, c_softcap=c_softcap
+        alpha_raise=alpha_raise, c_softcap=c_softcap, dw_floor=dw_floor
     )
 
     info = {
-        "note": "BW approximation policy (time-dependent threshold)",
+        "note": "BW approximation policy (time-dependent threshold) + DW scaling",
         "mu_eff": mu_eff,
         "sig_eff": sigma_eff,
         "theta_eff": theta_eff,
