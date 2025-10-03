@@ -1,5 +1,5 @@
-# 파일: tests/mt_nd_ratchet/user_pgdpo_base.py
-# 모델: 소비 랫칭 모델 (균형 잡힌 시장 생성기를 포함한 최종 완성본)
+# 파일: tests/mt_nd_retchet/user_pgdpo_base.py
+# 목적: 학습 베이스 + (코어 호환) 무인자 build_closed_form_policy() 제공
 
 import os
 import math
@@ -7,12 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+# --- CF 모듈 임포트 (상대/절대 폴백) ---
 try:
-    from scipy.integrate import solve_ivp
-    from scipy.optimize import brentq
-    _HAS_SCIPY = True
-except ImportError:
-    _HAS_SCIPY = False
+    from .closed_form_ref import build_cf_with_args
+except Exception:
+    from tests.mt_nd_retchet.closed_form_ref import build_cf_with_args
 
 # --------------------------- 기본 설정 ---------------------------
 d = int(os.getenv("PGDPO_D", 5)); k = 0
@@ -22,15 +22,22 @@ T = float(os.getenv("PGDPO_T", 1.5)); m = int(os.getenv("PGDPO_M", 40))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DIM_X = 2; DIM_Y = k; DIM_U = d + 1
-N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100)); CRN_SEED_EU   = int(os.getenv("PGDPO_CRN", 12345))
+N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100))
+CRN_SEED_EU = int(os.getenv("PGDPO_CRN", 12345))
+USE_CLOSED_FORM = bool(int(os.getenv("PGDPO_CF", "1")))
+RIM_STEPS = int(os.getenv("PGDPO_RIM_STEPS", str(max(200, m))))
 
 # --------------------------- 경제 파라미터 ---------------------------
-gamma = float(os.getenv("PGDPO_GAMMA", 2.0)); rho = float(os.getenv("PGDPO_RHO", 0.10))
-r = float(os.getenv("PGDPO_RF", 0.03)); kappa = float(os.getenv("PGDPO_KAPPA", 1.0))
-X0_range = (0.5, 2.0); H0_initial = 0.01; lb_X = 1e-6
+gamma = float(os.getenv("PGDPO_GAMMA", 3.0))
+rho   = float(os.getenv("PGDPO_RHO",   0.04))
+r     = float(os.getenv("PGDPO_RF",    0.01))
+kappa = float(os.getenv("PGDPO_KAPPA", 1.0))
+X0_range = (0.5, 2.0)
+H0_RATIO = float(os.getenv("PGDPO_H0_RATIO", 0.6))
+lb_X = 1e-6
 L_cap = float(os.getenv("PGDPO_LCAP", 1.0))
 
-# --------------------------- 시장 파라미터 생성 (개선됨) ---------------------------
+# --------------------------- 시장 파라미터 ---------------------------
 @torch.no_grad()
 def _nearest_spd_correlation(C: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     C = 0.5 * (C + C.T); evals, evecs = torch.linalg.eigh(C)
@@ -41,7 +48,7 @@ def _nearest_spd_correlation(C: torch.Tensor, eps: float = 1e-6) -> torch.Tensor
 @torch.no_grad()
 def _generate_mu_sigma_balanced(
     d: int, dev, seed: int | None = None, *,
-    vol_range=(0.18, 0.28), avg_corr=0.45, jitter=0.04, lam_factor=0.01,
+    vol_range=(0.16, 0.26), avg_corr=0.35, jitter=0.035, lam_factor=0.01,
     dirichlet_conc=10.0, target_leverage=None, alpha_mid=0.09,
     noise_std=0.01, hhi_factor=3.0
 ):
@@ -69,7 +76,6 @@ def _generate_mu_sigma_balanced(
     Sigma_inv = torch.linalg.inv(Sigma)
     return {"alpha": alpha, "Sigma": Sigma, "Sigma_inv": Sigma_inv}
 
-# (핵심) 균형 잡힌 시장 생성 함수 호출
 params = _generate_mu_sigma_balanced(
     d, device, seed=seed,
     target_leverage=0.7 * L_cap,
@@ -79,24 +85,30 @@ params = _generate_mu_sigma_balanced(
 alpha, Sigma, Sigma_inv = params["alpha"], params["Sigma"], params["Sigma_inv"]
 chol_S = torch.linalg.cholesky(Sigma)
 
-# --------------------------- 정책 신경망 ---------------------------
+# --------------------------- 학습 정책 ---------------------------
 class DirectPolicy(nn.Module):
     def __init__(self):
         super().__init__()
         state_dim = 3; hid = 256
-        self.net = nn.Sequential(nn.Linear(state_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, d + 2))
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hid), nn.ReLU(),
+            nn.Linear(hid, hid), nn.ReLU(),
+            nn.Linear(hid, d + 2)
+        )
     def forward(self, **states_dict):
         wealth, habit, TmT = states_dict['X'][:, 0:1], states_dict['X'][:, 1:2], states_dict['TmT']
-        state_input = torch.cat([wealth, habit / wealth.clamp_min(1e-8), TmT], dim=1)
-        raw_output = self.net(state_input)
-        u = L_cap * F.softmax(raw_output[:, :d+1], dim=1)[:, :d]
-        C = wealth - F.softplus(wealth - (habit + F.softplus(raw_output[:, d+1:])), beta=5.0)
+        s_in = torch.cat([wealth, habit / wealth.clamp_min(1e-8), TmT], dim=1)
+        raw = self.net(s_in)
+        u = L_cap * F.softmax(raw[:, :d+1], dim=1)[:, :d]
+        proposed = habit + F.softplus(raw[:, d+1:])
+        C = torch.max(proposed, habit)
         return torch.cat([u, C], dim=1)
 
-# --------------------------- 초기 상태 및 시뮬레이터 ---------------------------
+# --------------------------- 초기 상태/시뮬레이터 ---------------------------
 def sample_initial_states(B, *, rng=None):
     wealth0 = torch.rand((B, 1), device=device, generator=rng) * (X0_range[1] - X0_range[0]) + X0_range[0]
-    X0 = torch.cat([wealth0, torch.full_like(wealth0, H0_initial)], dim=1)
+    habit0  = (wealth0 * H0_RATIO).clamp_min(1e-6)
+    X0 = torch.cat([wealth0, habit0], dim=1)
     TmT0 = torch.rand((B, 1), device=device, generator=rng) * T
     return {'X': X0, 'Y': None, 'TmT': TmT0}, TmT0 / float(m)
 
@@ -108,8 +120,8 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     total_utility = torch.zeros((B, 1), device=device)
     for i in range(m_eff):
         t_i = T - (states['TmT'] - i * dt)
-        policy_output = policy(**{'X': torch.cat([wealth, habit], dim=1), 'TmT': states['TmT'] - i * dt})
-        u, C = policy_output[:, :d], policy_output[:, d:]
+        out = policy(**{'X': torch.cat([wealth, habit], dim=1), 'TmT': states['TmT'] - i * dt})
+        u, C = out[:, :d], out[:, d:]
         drift = r + (u * alpha).sum(1, keepdim=True) - 0.5 * (u.unsqueeze(1) @ Sigma @ u.unsqueeze(-1)).squeeze(-1) - C / wealth
         dBX = (u @ chol_S * Z[:, i, :]).sum(1, keepdim=True)
         wealth = torch.exp(torch.log(wealth) + drift * dt + dBX * dt.sqrt()).clamp_min(lb_X)
@@ -120,46 +132,34 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     total_utility += torch.exp(torch.tensor(-rho * T, device=device)) * kappa * terminal_utility
     return total_utility.view(-1)
 
-# --------------------------- 준-분석적 해 계산 로직 ---------------------------
-def _solve_static_portfolio(alpha, Sigma, gamma, L_cap):
-    u_unc = (1.0 / gamma) * torch.linalg.solve(Sigma, alpha)
-    u_pos = u_unc.clamp_min(0.0); s = float(u_pos.sum().item())
-    return u_pos * (L_cap / s) if s > L_cap and s > 0 else u_pos
-def _solve_ratchet_free_boundary(params_np, z_low=1.01, z_high=200.0, z_min=1e-5):
-    g, rh, r, mu, s2 = [float(params_np[k]) for k in ['gamma', 'rho', 'r', 'mu_eff', 'sig2_eff']]; s2 = max(s2, 1e-12)
-    def ode(z, y): return np.array([y[1], (rh*y[0] - 1/(1-g) - ((r+mu)*z-1)*y[1])/(0.5*s2*z*z)])
-    def ic(zs): A1 = rh*zs - (1-g)*((r+mu)*zs-1-0.5*s2*g*zs); vp=(1-rh)/(1e-12 if abs(A1)<1e-12 else A1); return (1+zs*vp)/(1-g), vp
-    def shoot(zs): v0, vp0 = ic(zs); sol=solve_ivp(ode, [zs, z_min], [v0, vp0], method='LSODA'); return sol.y[1,-1]*sol.t[-1] if sol.success else np.nan
-    grid = np.geomspace(z_low, z_high, 60); vals = np.array([shoot(zs) for zs in grid])
-    fin = np.where(np.isfinite(vals))[0]
-    if not fin.size: return grid[0]
-    sgn, idx = np.sign(vals[fin]), np.where(np.sign(vals[fin][:-1]) * np.sign(vals[fin][1:]) < 0)[0]
-    if idx.size: return float(brentq(shoot, grid[fin[idx[0]]], grid[fin[idx[0]+1]]))
-    return float(grid[fin[np.nanargmin(np.abs(vals[fin]))]])
-class ClosedFormPolicy(nn.Module):
-    def __init__(self, u_star, z_star): super().__init__(); self.register_buffer("u_star", u_star); self.z_star = z_star
-    def forward(self, **states_dict):
-        wealth, habit = states_dict['X'][:, 0:1], states_dict['X'][:, 1:2]
-        u = self.u_star.unsqueeze(0).expand(wealth.size(0), -1); z = wealth/habit.clamp_min(1e-8)
-        C = torch.min(torch.where(z > self.z_star, wealth / self.z_star, habit), wealth)
-        return torch.cat([u, C], dim=1)
+# --------------------------- (코어 호환) 무인자 CF 빌더 ---------------------------
+Z_MARGIN    = float(os.getenv("PGDPO_Z_MARGIN", "0.15"))   # 경계 15% 상향
+ALPHA_RAISE = float(os.getenv("PGDPO_ALPHA_RAISE", "0.7")) # 70%만 올리고 나머지는 Y 유지
+C_SOFTCAP   = os.getenv("PGDPO_C_SOFTCAP", "None")
+C_SOFTCAP   = None if C_SOFTCAP=="None" else float(C_SOFTCAP)
 
 def build_closed_form_policy():
-    if not _HAS_SCIPY: return None, {"note": "scipy not found"}
+    return build_cf_with_args(
+        alpha=alpha, Sigma=Sigma, gamma=gamma, L_cap=L_cap,
+        rho=rho, r=r, T=T, rim_steps=RIM_STEPS, device=device,
+        z_margin=Z_MARGIN, alpha_raise=ALPHA_RAISE, c_softcap=C_SOFTCAP
+    )
+
+# (선택) 로딩 확인용 프리로드
+CF_POLICY, CF_INFO = (None, {})
+if USE_CLOSED_FORM:
     try:
-        print("✅ Computing semi-analytical benchmark for ratchet model...")
-        u_star = _solve_static_portfolio(alpha, Sigma, gamma, L_cap)
-        params_np = {'gamma':gamma,'rho':rho,'r':r,'mu_eff':(alpha@u_star).item(),'sig2_eff':(u_star@Sigma@u_star).item()}
-        z_star = _solve_ratchet_free_boundary(params_np)
-        print(f"   ... Found critical ratio z* = {z_star:.4f}")
-        return ClosedFormPolicy(u_star.to(device), z_star), {"note": f"Semi-analytical solution with z*={z_star:.4f}"}
+        CF_POLICY, CF_INFO = build_closed_form_policy()
+        print(f"[CF] loaded? {CF_POLICY is not None} | note={CF_INFO['note']}, "
+              f"mu={CF_INFO['mu_eff']:.4f}, sig={CF_INFO['sig_eff']:.4f}, "
+              f"z_min={CF_INFO.get('z_min','?')}, z_max={CF_INFO.get('z_max','?')}")
     except Exception as e:
-        print(f"[WARN] Failed to compute semi-analytical solution: {e}"); return None, {"note": "failed to compute"}
+        print(f"[WARN] CF preload failed: {e}")
 
 # --------------------------- 시각화 스키마 ---------------------------
 def get_traj_schema():
     u_labels = [f"u_{i+1}" for i in range(d)] + ["Consumption"]
-    x_labels = ["Wealth", "Habit"]
+    x_labels = ["Wealth (X)", "Ratchet Y"]
     return {
         "roles": {"X": {"dim": DIM_X, "labels": x_labels}, "U": {"dim": DIM_U, "labels": u_labels}},
         "views": [
