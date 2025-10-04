@@ -87,20 +87,33 @@ def _generate_mu_sigma_balanced(
 ):
     if seed is not None:
         torch.manual_seed(seed)
-    sigma = torch.empty(d, device=dev).uniform_(*vol_range)
-    Psi = torch.full((d, d), float(avg_corr), device=dev); Psi.fill_diagonal_(1.0)
-    if jitter > 0:
-        N = torch.randn(d, d, device=dev) * jitter
-        Psi = _nearest_spd_correlation(Psi + 0.5 * (N + N.T))
-    Sigma = torch.diag(sigma) @ Psi @ torch.diag(sigma)
+        
+    # d=1일 경우 0으로 나누는 것을 방지
+    if d > 1:
+        sigma = torch.empty(d, device=dev).uniform_(*vol_range)
+    else:
+        sigma = torch.tensor([vol_range[0]], device=dev)
+        
+    if d > 1:
+        Psi = torch.full((d, d), float(avg_corr), device=dev); Psi.fill_diagonal_(1.0)
+        if jitter > 0:
+            N = torch.randn(d, d, device=dev) * jitter
+            Psi = _nearest_spd_correlation(Psi + 0.5 * (N + N.T))
+        Sigma = torch.diag(sigma) @ Psi @ torch.diag(sigma)
+    else:
+        Sigma = torch.tensor([[sigma.item()**2]], device=dev)
+        
     Sigma = Sigma + lam_factor * Sigma.diag().mean() * torch.eye(d, device=dev)
 
     # 분산된 기준 비중
-    w_ref = torch.distributions.Dirichlet(torch.full((d,), float(dirichlet_conc), device=dev)).sample()
-    hhi_target = hhi_factor / d
-    if (w_ref**2).sum() > hhi_target:
-        mix = 0.4; w_ref = (1 - mix) * w_ref + mix * (torch.ones(d, device=dev) / d)
-
+    if d > 1:
+        w_ref = torch.distributions.Dirichlet(torch.full((d,), float(dirichlet_conc), device=dev)).sample()
+        hhi_target = hhi_factor / d
+        if (w_ref**2).sum() > hhi_target:
+            mix = 0.4; w_ref = (1 - mix) * w_ref + mix * (torch.ones(d, device=dev) / d)
+    else:
+        w_ref = torch.tensor([1.0], device=dev)
+        
     if target_leverage is not None: s = float(target_leverage)
     else: s = float(alpha_mid / (gamma * (Sigma @ w_ref).mean().clamp_min(1e-8)).item())
     alpha = gamma * s * (Sigma @ w_ref)
@@ -172,8 +185,7 @@ class DirectPolicy(nn.Module):
 # --------------------------- 초기 상태/시뮬레이터 ---------------------------
 def sample_initial_states(B, *, rng=None):
     wealth0 = torch.rand((B, 1), device=device, generator=rng) * (X0_range[1] - X0_range[0]) + X0_range[0]
-    #habit0  = (wealth0 * H0_RATIO).clamp_min(1e-8)  # 랫칫 관찰 용이
-    habit0 = torch.rand((B, 1), device=device, generator=rng) * wealth0   # 랫칫 관찰 용
+    habit0 = torch.rand((B, 1), device=device, generator=rng) * wealth0
     habit0 = habit0.clamp_min(1e-8)
     X0 = torch.cat([wealth0, habit0], dim=1)
     TmT0 = torch.rand((B, 1), device=device, generator=rng) * T
@@ -248,13 +260,14 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
 
 # --------------------------- (코어 호환) 무인자 CF 빌더 ---------------------------
 ALPHA_RAISE = float(os.getenv("PGDPO_ALPHA_RAISE", "1.0"))
-DW_FLOOR_CF = float(os.getenv("PGDPO_DW_FLOOR_CF", "0.0"))
+# DW_FLOOR_CF 변수는 더 이상 사용하지 않고 DW_FLOOR로 통일합니다.
+# DW_FLOOR_CF = float(os.getenv("PGDPO_DW_FLOOR_CF", "0.0"))
 
 def build_closed_form_policy():
     return build_cf_with_args(
         alpha=alpha, Sigma=Sigma, gamma=gamma, L_cap=L_cap,
         rho=rho, r=r, T=T, rim_steps=RIM_STEPS, device=device,
-        alpha_raise=ALPHA_RAISE, c_softcap=C_SOFTCAP, dw_floor=DW_FLOOR_CF
+        alpha_raise=ALPHA_RAISE, c_softcap=C_SOFTCAP, dw_floor=DW_FLOOR
     )
 
 # (선택) 프리로드

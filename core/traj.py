@@ -16,22 +16,20 @@ import matplotlib.pyplot as plt
 
 from pgdpo_base import (
     device, T, m, d, k, DIM_X, DIM_U, CRN_SEED_EU, N_eval_states,
-    sample_initial_states, simulate,
+    sample_initial_states, simulate, make_generator,
 )
 
 # ----------------------------
 # ENV 토글 (플롯/저장 동작 제어)
 # ----------------------------
-PGDPO_TRAJ_B   = int(os.getenv("PGDPO_TRAJ_B", 1))     # 평가 배치 B(없으면 N_eval_states 사용)
+PGDPO_TRAJ_B   = int(os.getenv("PGDPO_TRAJ_B", 1))
 PGDPO_CURRENT_MODE = os.getenv("PGDPO_CURRENT_MODE", "unknown")
 PP_MODE = os.getenv('PP_MODE','direct').lower()
 
-# ✅ 추가: 저장/플롯 제어용 토글
-PGDPO_TRAJ_BMAX       = int(os.getenv("PGDPO_TRAJ_BMAX", "5"))   # 선택할 경로 수(Bsel 크기)
-PGDPO_TRAJ_SAVE_ALL   = int(os.getenv("PGDPO_TRAJ_SAVE_ALL", "1"))  # 1이면 CSV에 path별 컬럼 모두 저장, 0이면 평균
-PGDPO_TRAJ_PLOT_FIRST = int(os.getenv("PGDPO_TRAJ_PLOT_FIRST", "1")) # 1이면 플롯은 path#0만, 0이면 평균
+PGDPO_TRAJ_BMAX       = int(os.getenv("PGDPO_TRAJ_BMAX", "5"))
+PGDPO_TRAJ_SAVE_ALL   = int(os.getenv("PGDPO_TRAJ_SAVE_ALL", "1"))
+PGDPO_TRAJ_PLOT_FIRST = int(os.getenv("PGDPO_TRAJ_PLOT_FIRST", "1"))
 
-# 러너/프로젝션 유틸
 _HAS_RUNNER, _HAS_DIRECT = False, False
 try:
     from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
@@ -45,23 +43,14 @@ try:
 except ImportError:
     estimate_costates, PP_NEEDS = None, ()
 
-# --- User-defined extras ---
-try:
-    from user_pgdpo_base import ref_signals_fn as _REF_FN
-except Exception:
-    _REF_FN = None
-try:
-    from user_pgdpo_base import R_INFO as _R_INFO
-except Exception:
-    _R_INFO = {}
-try:
-    from user_pgdpo_base import price as harvesting_income
-except ImportError:
-    harvesting_income = None
-try:
-    from user_pgdpo_base import calculate_rt
-except (ImportError, AttributeError):
-    calculate_rt = None
+try: from user_pgdpo_base import ref_signals_fn as _REF_FN
+except Exception: _REF_FN = None
+try: from user_pgdpo_base import R_INFO as _R_INFO
+except Exception: _R_INFO = {}
+try: from user_pgdpo_base import price as harvesting_income
+except ImportError: harvesting_income = None
+try: from user_pgdpo_base import calculate_rt
+except (ImportError, AttributeError): calculate_rt = None
 
 # ----------------------------
 # Schema
@@ -123,12 +112,6 @@ def _linspace_time(n_steps: int) -> np.ndarray:
     return np.linspace(0.0, float(T), num=n_steps)
 
 def _as_ts1d(y: np.ndarray | list | float, T: int) -> np.ndarray:
-    """
-    어떤 입력이 와도 길이 T의 1D 타임시리즈로 강제 변환.
-    - 스칼라/길이 1 → T 길이로 반복
-    - 2D 이상 → 가능한 축에서 T를 찾아 1D로 압축
-    - 그래도 안 맞으면 선형보간으로 리샘플
-    """
     a = np.asarray(y)
     if a.ndim == 0:
         return np.full(T, float(a))
@@ -138,17 +121,14 @@ def _as_ts1d(y: np.ndarray | list | float, T: int) -> np.ndarray:
             return a.astype(float)
         if a.shape[0] == 1:
             return np.full(T, float(a[0]))
-        # 리샘플
         xp = np.linspace(0.0, 1.0, num=a.shape[0])
         x  = np.linspace(0.0, 1.0, num=T)
         return np.interp(x, xp, a.astype(float))
-    # 2D 이상
     for ax in range(a.ndim):
         if a.shape[ax] == T:
             sl = [0]*a.ndim
             sl[ax] = slice(None)
             return a[tuple(sl)].reshape(T).astype(float)
-    # 리샘플
     flat = a.reshape(-1).astype(float)
     xp = np.linspace(0.0, 1.0, num=flat.shape[0])
     x  = np.linspace(0.0, 1.0, num=T)
@@ -269,20 +249,12 @@ def _simulate_and_record(policy: nn.Module, B: int, rng: torch.Generator, sync_t
     simulate(recorder, B, initial_states_dict=init, m_steps=m, train=False, rng=rng)
     return recorder.stacked()
 
-# ----------------------------
-# Series/CSV 생성
-# ----------------------------
+# ... (이하 _series_for_view_wrapper, _save_series_to_csv, _save_full_trajectories_to_csv, _plot_lines 함수들은 그대로 유지)
 def _series_for_view(
     view: Dict[str, Any],
     traj_np: Dict[str, Any],
     Bsel: List[int],
 ) -> Tuple[np.ndarray, List[np.ndarray], List[str]]:
-    """
-    플롯용 시계열 생성:
-    - 기본적으로 path #0만 사용(PGDPO_TRAJ_PLOT_FIRST=1), 아니면 선택 경로 평균
-    - 단일 인덱스여도 (T, 1)을 유지해 수평선 복제 현상 방지
-    - 유효하지 않은 인덱스는 스킵(몰래 0번으로 대체하지 않음)
-    """
     block_names = view.get("block", "X")
     if isinstance(block_names, str):
         block_names = [block_names]
@@ -295,11 +267,11 @@ def _series_for_view(
         if block_name not in traj_np:
             continue
 
-        arr = _to_np(traj_np.get(block_name))          # 보통 (B, T, dim)
-        if arr.ndim == 2:                               # (B, T) → (B, T, 1)
+        arr = _to_np(traj_np.get(block_name))
+        if arr.ndim == 2:
             arr = arr[..., None]
 
-        arr_sel = arr[Bsel]                             # (Bsel, T, dim)
+        arr_sel = arr[Bsel]
         steps = arr.shape[1]
         if x_time is None:
             x_time = _linspace_time(steps)
@@ -309,19 +281,17 @@ def _series_for_view(
 
         indices = view.get("indices", [0])
         valid_indices = [i for i in indices if 0 <= i < arr_sel.shape[-1]]
-        if not valid_indices:                           # 잘못된 인덱스면 스킵
+        if not valid_indices:
             continue
 
         if PGDPO_TRAJ_PLOT_FIRST:
-            data = arr_sel[0, :, valid_indices]         # (T, k) 또는 (T,)
+            data = arr_sel[0, :, valid_indices]
         else:
-            data = arr_sel[..., valid_indices].mean(axis=0)  # (T, k)
+            data = arr_sel[..., valid_indices].mean(axis=0)
 
-        # 단일 인덱스여도 (T, 1) 유지
         if data.ndim == 1:
             data = data.reshape(-1, 1)
 
-        # 1D 시리즈로 분해
         series = [data[:, i] for i in range(data.shape[1])]
         labels = (
             [labels_info[idx] for idx in valid_indices]
@@ -331,9 +301,8 @@ def _series_for_view(
         all_series.extend(series)
         all_labels.extend(labels)
 
-    # x_time은 최소 하나의 블록에서 steps를 보고 설정됨
     if x_time is None:
-        x_time = _linspace_time(m)  # 방어적; 빈 뷰면 길이 m로
+        x_time = _linspace_time(m)
 
     return x_time, all_series, all_labels
 
@@ -344,21 +313,15 @@ def _handle_custom_view(
     Bsel: list,
     policy_tag: str | None = None
 ) -> Optional[Tuple[np.ndarray, List[np.ndarray], List[str]]]:
-    """
-    커스텀 뷰 핸들러:
-    - u_rnorm, tracking_vpp, custom_sir_rt_plot, custom_sir_i_plot
-    - consumption_path / mode="consumption": C 블록 → (없으면) U 마지막 칼럼을 소비로 추출
-    """
     mode = (view.get("mode", "") or "").lower()
     name = (view.get("name", "") or "").lower()
 
-    # -------- (1) u_rnorm --------
     if mode == "u_rnorm":
-        U = _to_np(traj_np["U"])[Bsel, :, :d]                  # (Bsel, T, d)
+        U = _to_np(traj_np["U"])[Bsel, :, :d]
         x_time = _linspace_time(U.shape[1])
         if "R" in _R_INFO:
             R = _R_INFO["R"].cpu().numpy()
-            uRu = np.einsum("bti,ij,btj->bt", U, R, U)         # (Bsel, T)
+            uRu = np.einsum("bti,ij,btj->bt", U, R, U)
             y = uRu[0] if PGDPO_TRAJ_PLOT_FIRST else uRu.mean(axis=0)
             r_norm_series = np.sqrt(_as_ts1d(y, len(x_time)))
         else:
@@ -374,9 +337,8 @@ def _handle_custom_view(
                 r_norm_series = np.sqrt(alpha) * _as_ts1d(y, len(x_time))
         return x_time, [r_norm_series], [view.get("block", "U")]
 
-    # -------- (2) tracking_vpp --------
     if mode == "tracking_vpp":
-        U = _to_np(traj_np["U"])[Bsel]                         # (Bsel, T, dim)
+        U = _to_np(traj_np["U"])[Bsel]
         x_time = _linspace_time(U.shape[1])
         y = U[0].sum(axis=-1) if PGDPO_TRAJ_PLOT_FIRST else U.sum(axis=-1).mean(axis=0)
         series, labels = [_as_ts1d(y, len(x_time))], ["Output_Power_Sum"]
@@ -387,9 +349,8 @@ def _handle_custom_view(
                 labels.append(f"{key}_ref")
         return x_time, series, labels
 
-    # -------- (3) custom_sir_rt_plot --------
     if mode == "custom_sir_rt_plot":
-        Rt = _to_np(traj_np.get("Rt"))[Bsel]                   # (Bsel, T, 1) or (Bsel, T)
+        Rt = _to_np(traj_np.get("Rt"))[Bsel]
         x_time = _linspace_time(Rt.shape[1])
         y_rt = Rt[0].flatten() if PGDPO_TRAJ_PLOT_FIRST else Rt.mean(axis=0).flatten()
 
@@ -402,7 +363,6 @@ def _handle_custom_view(
         )
         return x_time, [_as_ts1d(y_rt, len(x_time)), _as_ts1d(y_i, len(x_time))], ["Effective_Rt", "Total_Infected"]
 
-    # -------- (4) custom_sir_i_plot --------
     if mode == "custom_sir_i_plot":
         X = _to_np(traj_np.get("X"))[Bsel]
         x_time = _linspace_time(X.shape[1])
@@ -414,33 +374,27 @@ def _handle_custom_view(
         )
         return x_time, [_as_ts1d(y, len(x_time))], ["Total_Infected"]
 
-    # -------- (5) Consumption (안전 처리) --------
     if name == "consumption_path" or mode == "consumption":
         C = None
-        # (a) C 블록이 있으면 우선 사용
         if "C" in traj_np:
-            C = _to_np(traj_np["C"])[Bsel]                     # (B, T) or (B, T, 1)
+            C = _to_np(traj_np["C"])[Bsel]
             if C.ndim == 2:
-                C = C[..., None]                               # (B, T, 1)
-        # (b) 없으면 U의 마지막 성분을 소비로 가정(포트폴리오 d + 소비 1)
+                C = C[..., None]
         elif "U" in traj_np:
-            U = _to_np(traj_np["U"])[Bsel]                     # (B, T, dimU)
+            U = _to_np(traj_np["U"])[Bsel]
             if U.ndim == 2:
                 U = U[..., None]
             if U.shape[2] > d:
-                C = U[..., -1:]                                # (B, T, 1)
+                C = U[..., -1:]
 
         if C is None:
-            return None  # 소비를 찾지 못하면 뷰 스킵
+            return None
 
         x_time = _linspace_time(C.shape[1])
         y = C[0, :, 0] if PGDPO_TRAJ_PLOT_FIRST else C[..., 0].mean(axis=0)
         return x_time, [_as_ts1d(y, len(x_time))], ["Consumption"]
 
-    # 매치되는 커스텀 뷰 없음 → 일반 처리에게 맡김
     return None
-
-
 
 def _series_for_view_wrapper(view, traj_np, Bsel, policy_tag=None):
     if (view.get("name","").lower().startswith("tracking")):
@@ -451,34 +405,23 @@ def _series_for_view_wrapper(view, traj_np, Bsel, policy_tag=None):
     return _series_for_view(view, traj_np, Bsel)
 
 def _save_series_to_csv(x_time, all_views_data, out_path):
-    """
-    요약 CSV(플롯에 사용된 시리즈들).
-    ✅ 모든 시리즈를 x_time 길이(T) 1D로 강제(_as_ts1d)해서 shape 불일치 방지.
-    """
     x_time = np.asarray(x_time, dtype=float).reshape(-1)
     Tlen = int(x_time.shape[0])
 
-    # 1) 컬럼 맵 구성 (중복 방지)
-    #    키: "component_policy" (ref는 component 이름 그대로)
     colmap: Dict[str, np.ndarray] = {}
     for view_name, series_map in all_views_data.items():
         for component, policies in sorted(series_map.items()):
             for policy, data in sorted(policies.items()):
                 col_name = component if ("ref" in component) else f"{component}_{policy}"
-                # 길이 강제: (스칼라/길이1/2D 등) -> 길이 T 1D
                 y = _as_ts1d(data, Tlen)
-                # 최초 등장만 기록(중복 이름은 스킵)
                 if col_name not in colmap:
                     colmap[col_name] = y
 
-    # 2) 헤더/행 구성
     header = ["Time"] + list(colmap.keys())
     cols = [x_time] + [colmap[h] for h in header[1:]]
 
-    # 모두 길이 T의 1D 벡터가 됨 → 안전하게 스택 가능
     rows = np.stack(cols, axis=-1)
 
-    # 3) CSV 저장
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
@@ -492,21 +435,15 @@ def _save_full_trajectories_to_csv(
     Bsel: List[int],
     out_path: str
 ):
-    """
-    모든 정책의 모든 상태/제어 변수를 CSV로 저장.
-    ✅ 변경: PGDPO_TRAJ_SAVE_ALL=1이면 평균 대신 path별 컬럼을 전부 기록.
-    """
     if not trajectories:
         return
 
-    # 1) 시간축
     first_valid_traj = next((t for t in trajectories.values() if t is not None), None)
     if first_valid_traj is None:
         return
     n_steps = first_valid_traj["X"].shape[1]
     x_time = _linspace_time(n_steps)
 
-    # 2) 헤더/데이터 맵
     header = ["Time"]
     all_data_map: Dict[str, np.ndarray] = {}
 
@@ -519,7 +456,7 @@ def _save_full_trajectories_to_csv(
             if block_name not in roles:
                 continue
 
-            arr_sel = _to_np(block_tensor[Bsel])  # (Bsel, n_steps, dim) 또는 (Bsel, n_steps, 1)
+            arr_sel = _to_np(block_tensor[Bsel])
             if arr_sel.ndim == 2:
                 arr_sel = arr_sel[..., None]
             labels = roles[block_name].get(
@@ -528,7 +465,6 @@ def _save_full_trajectories_to_csv(
             )
 
             if PGDPO_TRAJ_SAVE_ALL:
-                # 경로별 저장
                 for b_idx, b in enumerate(Bsel):
                     for i in range(arr_sel.shape[-1]):
                         col = f"{labels[i]}_{policy_name}_p{b}"
@@ -536,8 +472,7 @@ def _save_full_trajectories_to_csv(
                             header.append(col)
                         all_data_map[col] = arr_sel[b_idx, :, i]
             else:
-                # 평균 저장(기존)
-                block_np_avg = arr_sel.mean(axis=0)  # (n_steps, dim)
+                block_np_avg = arr_sel.mean(axis=0)
                 for i in range(block_np_avg.shape[1]):
                     col = f"{labels[i]}_{policy_name}"
                     if col not in header:
@@ -555,9 +490,6 @@ def _save_full_trajectories_to_csv(
 
     print(f"[traj] Full trajectory data saved to: {os.path.basename(out_path)}")
 
-# ----------------------------
-# 플로팅
-# ----------------------------
 def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = {}):
     is_dual_axis = view_opts.get("mode") == "dual_axis"
 
@@ -593,7 +525,6 @@ def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = 
     for comp_label, policies in sorted(series_map.items()):
         ax = ax_map.get(comp_label, ax1)
         if "ref" in comp_label:
-            # ref 라인은 'cf' 키에 저장된 것을 기본으로 그림
             if "cf" in policies:
                 y = _as_ts1d(policies["cf"], Tlen)
                 ax.plot(x_time, y, label=POLICY_STYLES["ref"].get("label", comp_label),
@@ -601,7 +532,7 @@ def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = 
             continue
         for pkey in ["cf", "pp", "learn"]:
             if pkey in policies:
-                y = _as_ts1d(policies[pkey], Tlen)   # ✅ 길이 강제
+                y = _as_ts1d(policies[pkey], Tlen)
                 st = POLICY_STYLES.get(pkey, {})
                 full_label = f"{comp_label} - {st.get('label')}"
                 ax.plot(x_time, y, label=full_label,
@@ -642,7 +573,7 @@ def generate_and_save_trajectories(
     outdir = _ensure_outdir(outdir)
     B_all = int(PGDPO_TRAJ_B or N_eval_states)
     seed_crn = int(seed_crn or CRN_SEED_EU)
-    def _g(): return torch.Generator(device=device).manual_seed(seed_crn)
+    def _g(): return make_generator(seed_crn)
 
     print("[traj] Simulating trajectories for 'learn' policy...")
     traj_learn = _simulate_and_record(policy_learn.to(device), B_all, _g(), sync_time=True)
@@ -660,12 +591,10 @@ def generate_and_save_trajectories(
 
     trajectories = {"learn": traj_learn, "cf": traj_cf, "pp": traj_pp}
 
-    # ✅ ENV로 Bsel 크기 우선 결정
     schema_Bmax = SCHEMA.get("sampling", {}).get("Bmax", 5)
     Bmax = PGDPO_TRAJ_BMAX if PGDPO_TRAJ_BMAX > 0 else schema_Bmax
     Bsel = list(range(min(B_all, Bmax)))
 
-    # --- 플롯 & 요약 CSV ---
     all_views_data = {}
     master_x_time = None
 
@@ -700,7 +629,6 @@ def generate_and_save_trajectories(
     if master_x_time is not None and all_views_data:
         _save_series_to_csv(master_x_time, all_views_data, os.path.join(outdir, "traj_comparison_data.csv"))
 
-    # --- ✅ 풀 CSV (경로별 저장) ---
     _save_full_trajectories_to_csv(
         trajectories=trajectories,
         schema=SCHEMA,
