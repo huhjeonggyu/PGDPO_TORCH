@@ -33,7 +33,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DIM_X = 2; DIM_Y = k; DIM_U = d + 1
 N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100))
-CRN_SEED_EU = int(os.getenv("PGDPO_CRN", 68))
+CRN_SEED_EU = int(os.getenv("PGDPO_CRN", 70))
 USE_CLOSED_FORM = bool(int(os.getenv("PGDPO_CF", "1")))
 RIM_STEPS = int(os.getenv("PGDPO_RIM_STEPS", str(max(200, m))))
 
@@ -49,7 +49,7 @@ H0_RATIO = float(os.getenv("PGDPO_H0_RATIO", "0.02"))  # 초기 Y0 ≈ 0.02 * X0
 lb_X = 1e-6
 
 # 포트폴리오 총합(레버리지) 상한
-L_cap = float(os.getenv("PGDPO_LCAP", 1.0))
+L_cap = float(os.getenv("PGDPO_LCAP", 2.0))
 
 # 소비 파라미터화 / 스케일링
 C_PARAM     = os.getenv("PGDPO_C_PARAM", "pv")   # 'pv' | 'tau' | 'plain'
@@ -172,7 +172,9 @@ class DirectPolicy(nn.Module):
 # --------------------------- 초기 상태/시뮬레이터 ---------------------------
 def sample_initial_states(B, *, rng=None):
     wealth0 = torch.rand((B, 1), device=device, generator=rng) * (X0_range[1] - X0_range[0]) + X0_range[0]
-    habit0  = (wealth0 * H0_RATIO).clamp_min(1e-8)  # 랫칫 관찰 용이
+    #habit0  = (wealth0 * H0_RATIO).clamp_min(1e-8)  # 랫칫 관찰 용이
+    habit0 = torch.rand((B, 1), device=device, generator=rng) * wealth0   # 랫칫 관찰 용
+    habit0 = habit0.clamp_min(1e-8)
     X0 = torch.cat([wealth0, habit0], dim=1)
     TmT0 = torch.rand((B, 1), device=device, generator=rng) * T
     return {'X': X0, 'Y': None, 'TmT': TmT0}, TmT0 / float(m)
@@ -245,7 +247,7 @@ def simulate(policy, B, *, train=True, rng=None, initial_states_dict=None, rando
     return total_utility.view(-1)
 
 # --------------------------- (코어 호환) 무인자 CF 빌더 ---------------------------
-ALPHA_RAISE = float(os.getenv("PGDPO_ALPHA_RAISE", "0.9"))
+ALPHA_RAISE = float(os.getenv("PGDPO_ALPHA_RAISE", "1.0"))
 DW_FLOOR_CF = float(os.getenv("PGDPO_DW_FLOOR_CF", "0.0"))
 
 def build_closed_form_policy():

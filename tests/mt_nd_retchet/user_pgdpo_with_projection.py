@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # 파일: tests/mt_nd_retchet/user_pgdpo_with_projection.py
-# 목적: PMP 프로젝션(u & C) — 랫칫(Y), 소프트캡, 예산(X/dt)까지 즉시 반영한 안정판
+# 목적: PMP 프로젝션(u & C) — 랫칫(Y), 소프트캡, 예산(X/τ)까지 즉시 반영한 안정판
 from __future__ import annotations
 import os, math, torch
 
@@ -16,33 +16,60 @@ from user_pgdpo_base import (
     C_SOFT_BETA as RATCHET_BETA_CONST
 )
 
-# 하이퍼/장벽
-BARRIER_EPS   = float(os.getenv("PGDPO_BARRIER_EPS", "1e-3"))
-MAX_ITERS     = int(os.getenv("PGDPO_PROJ_ITERS", "30"))
+# --------------------------
+# 하이퍼/장벽 및 토글
+# --------------------------
+BARRIER_EPS   = float(os.getenv("PGDPO_BARRIER_EPS", "1e-6"))   # 장벽은 약하게
+MAX_ITERS     = int(os.getenv("PGDPO_PROJ_ITERS",   "30"))
 STEP_DECAY    = float(os.getenv("PGDPO_STEP_DECAY", "0.7"))
-RIDGE_C       = float(os.getenv("PGDPO_RIDGE_C", "1e-8"))
+RIDGE_C       = float(os.getenv("PGDPO_RIDGE_C",    "1e-8"))
 
-# 소비 상한: (i) 소프트캡 cap*X, (ii) 예산 X/dt — cap이 비어있어도 예산 캡은 항상 켭니다.
+# 랫칫 ∂Y/∂C 항 사용 여부(0=끄기 권장, 1=켜기)
+USE_LAMY      = int(os.getenv("PGDPO_USE_LAMY",     "0"))
+
+# trust region 강도(소비 한 step 변화량 ≤ TR_FRAC * X/τ)
+TR_FRAC       = float(os.getenv("PGDPO_TR_FRAC",    "0.2"))
+
+# 소비 상한: (i) 소프트캡 cap*X, (ii) 예산 X/τ — cap이 비어있어도 예산 캡은 항상 켭니다.
 _cap_env = os.getenv("PGDPO_C_SOFTCAP", "None")
 CAP_MULT = None if _cap_env == "None" else float(_cap_env) if _cap_env else None
 
+# --------------------------
+# 내부 유틸
+# --------------------------
 def _safe_newton_step(g: float, H: float) -> float:
-    # 뉴턴 스텝: dc = -g/H, H가 비정상/약하면 보수적으로 음수 곡률 가정
+    """뉴턴 스텝: dc = -g/H, H가 비정상/약하면 보수적으로 음수 곡률 가정"""
     H_eff = H
     if not math.isfinite(H_eff) or abs(H_eff) < 1e-12:
         H_eff = -1e-12
     return - g / H_eff
 
 def _clip_c(c: float, y: float, x: float, tau: float, eps: float) -> float:
-    """소비 범위를 [y+eps, min(cap*X, X/dt)-eps]로 안전 클리핑"""
-    # 예산 캡: dt ≈ tau / m
-    dt   = max(tau / max(1, int(M_STEPS_CONST)), 1e-6)
-    c_hi_budget = x / dt
-    c_hi_soft   = CAP_MULT * x if CAP_MULT is not None else float("inf")
-    c_hi        = min(c_hi_budget, c_hi_soft) - 1e-9
-    c_lo        = y + eps
+    """소비 범위를 [y+eps, min(cap*X, X/τ)-eps]로 안전 클리핑"""
+    tau_eff    = max(tau, 1e-6)
+    c_hi_bgt   = x / tau_eff
+    c_hi_soft  = CAP_MULT * x if CAP_MULT is not None else float("inf")
+    c_hi       = min(c_hi_bgt, c_hi_soft) - 1e-9
+    c_lo       = y + eps
     return max(c_lo, min(c, c_hi))
 
+def _frac_to_boundary(c: float, dc: float, y: float, x: float, tau: float, eps: float) -> float:
+    """장벽을 넘지 않도록 한 스텝에서 허용되는 최대 배율(alpha_max) 계산"""
+    tau_eff   = max(tau, 1e-6)
+    c_hi_bgt  = x / tau_eff
+    c_hi_soft = CAP_MULT * x if CAP_MULT is not None else float("inf")
+    c_hi      = min(c_hi_bgt, c_hi_soft) - 1e-9
+    c_lo      = y + eps
+    if dc > 0:
+        return max(0.0, 0.99 * (c_hi - c) / max(dc, 1e-12))
+    elif dc < 0:
+        return max(0.0, 0.99 * (c - c_lo) / max(-dc, 1e-12))
+    else:
+        return 0.0
+
+# --------------------------
+# 메인: 시점별 PMP 사영
+# --------------------------
 @torch.no_grad()
 def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     """
@@ -60,14 +87,14 @@ def project_pmp(costates: dict, states: dict) -> torch.Tensor:
     gamma = float(GAMMA_CONST)
     d     = int(alpha.numel())
 
-    X   = states["X"].to(device=device, dtype=dtype)            # (B,2)
+    X   = states["X"].to(device=device, dtype=dtype)            # (B,2) = [X, Y]
     tau = states.get("TmT", None)
     if tau is None:
         tau = torch.zeros((X.size(0), 1), device=device, dtype=dtype)
     else:
         tau = tau.to(device=device, dtype=dtype)
 
-    lam   = costates["JX"].to(device=device, dtype=dtype)
+    lam   = costates["JX"].to(device=device, dtype=dtype)       # (B,2)
     lam_x = lam[:, 0:1]
     lam_y = lam[:, 1:2]
 
@@ -92,8 +119,22 @@ def project_pmp(costates: dict, states: dict) -> torch.Tensor:
         lamx  = float(lam_x[b].item())
         lamy  = float(lam_y[b].item())
 
-        # 초기 c: Y 바로 위
-        c_b = _clip_c(max(y_b + eps_in, 0.02 * x_b), y_b, x_b, tau_b, eps_in)
+        # ----------------------------
+        # 소비 초기값: FOC 닫힌꼴로 워밍업
+        # e^{-ρ t} U'(C) = λ_X  ⇒  C* = (e^{ρ t} λ_X)^(-1/γ)
+        # (t = T - tau)
+        # ----------------------------
+        t_b   = T_CONST - tau_b
+        disc  = math.exp(- RHO_CONST * max(0.0, t_b))
+        lamx_eff = max(lamx, 1e-12)  # 음수/제로 방지
+        if abs(gamma - 1.0) > 1e-12:
+            c_star = (lamx_eff * math.exp(RHO_CONST * max(0.0, t_b))) ** (-1.0 / gamma)
+        else:
+            c_star = disc / lamx_eff
+        c_b = _clip_c(max(c_star, y_b + eps_in), y_b, x_b, tau_b, eps_in)
+
+        # trust-region: 한 스텝 소비 변화 상한(예산 상한의 TR_FRAC)
+        tr = TR_FRAC * (x_b / max(tau_b, 1e-6))
         step = 1.0
 
         for _ in range(MAX_ITERS):
@@ -103,50 +144,68 @@ def project_pmp(costates: dict, states: dict) -> torch.Tensor:
                 d2U = - gamma * (c_b) ** (-gamma - 1.0)
             else:
                 dU  = 1.0 / max(c_b, 1e-12)
-                d2U = - 1.0 / max(c_b, 1e-12) ** 2
+                d2U = - 1.0 / (max(c_b, 1e-12) ** 2)
 
-            # soft-ratchet의 ∂Y/∂C = σ(β(C-Y))
-            sig  = 1.0 / (1.0 + math.exp(-beta * (c_b - y_b)))
+            # 랫칫 장벽(+ε ln(C-Y)) ⇒ g_bar=ε/(C-Y), H_bar= -ε/(C-Y)^2
             g_bar = (eps_in / (c_b - y_b + 1e-12))
             H_bar = - (eps_in / (c_b - y_b + 1e-12) ** 2)
 
-            # (선택) 소프트캡의 장벽(곡률>0)
+            # (선택) ∂Y/∂C 항 — 기본은 끔(USE_LAMY=0)
+            sig = 0.0; sig_h = 0.0
+            if USE_LAMY:
+                sig   = 1.0 / (1.0 + math.exp(-beta * (c_b - y_b)))
+                sig_h = beta * sig * (1.0 - sig)
+
+            # (선택) 소프트캡 장벽(+ε ln(cmax-C))
             g_cap = 0.0; H_cap = 0.0
             if CAP_MULT is not None:
                 cmax = CAP_MULT * x_b
                 g_cap -= (eps_in / (cmax - c_b + 1e-12))
                 H_cap += (eps_in / (cmax - c_b + 1e-12) ** 2)
 
-            # 할인因子(절대시간 t = T - τ)
-            disc = math.exp(- RHO_CONST * max(0.0, (T_CONST - tau_b)))
-
-            # FOC in C: e^{-ρt}u'(C) - λ_X + λ_Y σ + barriers
-            g_c  = disc * dU - lamx + lamy * sig + g_bar + g_cap
-            H_cc = disc * d2U + lamy * beta * sig * (1.0 - sig) + H_bar + H_cap - RIDGE_C
+            # FOC in C: e^{-ρt}U'(C) - λ_X + [λ_Y σ] + barriers
+            g_c  = disc * dU - lamx + (lamy * sig if USE_LAMY else 0.0) + g_bar + g_cap
+            H_cc = disc * d2U + (lamy * sig_h if USE_LAMY else 0.0) + H_bar + H_cap - RIDGE_C
 
             dc = _safe_newton_step(g_c, H_cc)
-            if abs(dc) < 1e-12: break
+            if not math.isfinite(dc):
+                dc = 0.0
+            # trust-region & fraction-to-boundary
+            dc   = max(-tr, min(dc, tr))
+            if abs(dc) < 1e-12:
+                break
+            alpha_max = _frac_to_boundary(c_b, dc, y_b, x_b, tau_b, eps_in)
+            if alpha_max <= 0.0:
+                break
+            step = min(step, alpha_max)
 
-            # 라인서치(단순 감쇠) + 경계 내부 보정
             c_new = _clip_c(c_b + step * dc, y_b, x_b, tau_b, eps_in)
+
             # 수렴 기준
             if abs(c_new - c_b) <= 1e-6 * (1.0 + abs(c_b)):
                 c_b = c_new
                 break
 
             # 진행/감쇠
-            if (c_new - c_b) * dc > 0:  # 같은 방향이면 유지
+            if (c_new - c_b) * dc > 0:  # 같은 방향이면 유지/약간 증대
                 c_b = c_new
                 step = min(1.0, step * 1.2)
             else:                        # 반대면 감쇠
                 step *= STEP_DECAY
                 c_b = c_new
 
-        # 최종 u: DW 스케일
-        AF   = (tau_b if abs(R_CONST) < 1e-12 else (1.0 - math.exp(- R_CONST * tau_b)) / R_CONST)
-        pvC  = AF * c_b
-        dw   = max(0.0, min(1.0, 1.0 - pvC / max(x_b, 1e-12)))
-        u_b  = u_base * dw
+        # ----------------------------
+        # 최종 u: DW 스케일링 (1 - PV(C)/X)
+        # PV(C) = C * ((1 - e^{-rτ})/r) 혹은 r≈0이면 τ*C
+        # ----------------------------
+        if abs(R_CONST) < 1e-12:
+            AF = tau_b
+        else:
+            AF = (1.0 - math.exp(- R_CONST * tau_b)) / R_CONST
+        pvC = AF * c_b
+        dw  = max(0.0, min(1.0, 1.0 - pvC / max(x_b, 1e-12)))
+
+        u_b = u_base * dw
         # L1 내부 유지
         s = float(u_b.sum().item())
         if s >= L_cap:
