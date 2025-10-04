@@ -1,11 +1,9 @@
-# 파일: core/traj.py
-
 # -*- coding: utf-8 -*-
 # core/traj.py — schema-driven, multi-domain trajectory visualization
-# - [업데이트] cf, pp, learn 정책 궤적을 하나의 그래프에 통합하여 출력
-# - ✨ [추가] 시각화에 사용된 모든 궤적 데이터를 CSV 파일로 저장하는 기능
-# - ✨ [SIR] R_t, Co-state 기록 및 SIR 전용 커스텀 플롯 모드 추가
-
+# - cf/pp/learn 궤적을 같은 그래프에 통합 출력
+# - 시각화에 사용된 모든 궤적 데이터를 CSV로 저장
+# - SIR 전용 커스텀 플롯 지원
+# - ✅ (업데이트) CSV에는 선택된 모든 path를 각각 기록하고, 플롯은 첫 번째 path만 사용(토글 가능)
 from __future__ import annotations
 import os, json, time, csv
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,102 +19,186 @@ from pgdpo_base import (
     sample_initial_states, simulate,
 )
 
-PGDPO_TRAJ_B  = int(os.getenv("PGDPO_TRAJ_B", 1))
+# ----------------------------
+# ENV 토글 (플롯/저장 동작 제어)
+# ----------------------------
+PGDPO_TRAJ_B   = int(os.getenv("PGDPO_TRAJ_B", 1))     # 평가 배치 B(없으면 N_eval_states 사용)
 PGDPO_CURRENT_MODE = os.getenv("PGDPO_CURRENT_MODE", "unknown")
 PP_MODE = os.getenv('PP_MODE','direct').lower()
+
+# ✅ 추가: 저장/플롯 제어용 토글
+PGDPO_TRAJ_BMAX       = int(os.getenv("PGDPO_TRAJ_BMAX", "5"))   # 선택할 경로 수(Bsel 크기)
+PGDPO_TRAJ_SAVE_ALL   = int(os.getenv("PGDPO_TRAJ_SAVE_ALL", "1"))  # 1이면 CSV에 path별 컬럼 모두 저장, 0이면 평균
+PGDPO_TRAJ_PLOT_FIRST = int(os.getenv("PGDPO_TRAJ_PLOT_FIRST", "1")) # 1이면 플롯은 path#0만, 0이면 평균
+
+# 러너/프로젝션 유틸
 _HAS_RUNNER, _HAS_DIRECT = False, False
-try: from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
-except ImportError: pass
-try: from pgdpo_with_projection import ppgdpo_u_direct, REPEATS as REPEATS_DIR, SUBBATCH as SUBBATCH_DIR, estimate_costates, PP_NEEDS; _HAS_DIRECT = True
-except ImportError: estimate_costates, PP_NEEDS = None, ()
+try:
+    from pgdpo_run import ppgdpo_u_run, REPEATS as REPEATS_RUN, SUBBATCH as SUBBATCH_RUN; _HAS_RUNNER = True
+except ImportError:
+    pass
+try:
+    from pgdpo_with_projection import (
+        ppgdpo_u_direct, REPEATS as REPEATS_DIR, SUBBATCH as SUBBATCH_DIR,
+        estimate_costates, PP_NEEDS
+    ); _HAS_DIRECT = True
+except ImportError:
+    estimate_costates, PP_NEEDS = None, ()
 
+# --- User-defined extras ---
+try:
+    from user_pgdpo_base import ref_signals_fn as _REF_FN
+except Exception:
+    _REF_FN = None
+try:
+    from user_pgdpo_base import R_INFO as _R_INFO
+except Exception:
+    _R_INFO = {}
+try:
+    from user_pgdpo_base import price as harvesting_income
+except ImportError:
+    harvesting_income = None
+try:
+    from user_pgdpo_base import calculate_rt
+except (ImportError, AttributeError):
+    calculate_rt = None
 
-# --- User-defined functions ---
-try: from user_pgdpo_base import ref_signals_fn as _REF_FN
-except Exception: _REF_FN = None
-try: from user_pgdpo_base import R_INFO as _R_INFO
-except Exception: _R_INFO = {}
-try: from user_pgdpo_base import price as harvesting_income
-except ImportError: harvesting_income = None
-try: from user_pgdpo_base import calculate_rt
-except (ImportError, AttributeError): calculate_rt = None
-
-
-# --- Schema Logic ---
+# ----------------------------
+# Schema
+# ----------------------------
 def _try_load_user_schema() -> Optional[Dict[str, Any]]:
-    try: from user_pgdpo_base import get_traj_schema; return get_traj_schema()
-    except (ImportError, AttributeError): pass
+    try:
+        from user_pgdpo_base import get_traj_schema
+        return get_traj_schema()
+    except (ImportError, AttributeError):
+        pass
     return None
+
 def _get_base_default_views() -> List[Dict[str, Any]]:
     views: List[Dict[str, Any]] = []
-    if DIM_X and int(DIM_X) > 0: views.append({"name": "X_first_components", "block": "X", "mode": "indices", "indices": [0], "ylabel": "X[0] Component"})
-    if DIM_U and int(DIM_U) > 0: views.append({"name": "U_first_components", "block": "U", "mode": "indices", "indices": [0], "ylabel": "U[0] Component"})
+    if DIM_X and int(DIM_X) > 0:
+        views.append({"name": "X_first_components", "block": "X",
+                      "mode": "indices", "indices": [0], "ylabel": "X[0] Component"})
+    if DIM_U and int(DIM_U) > 0:
+        views.append({"name": "U_first_components", "block": "U",
+                      "mode": "indices", "indices": [0], "ylabel": "U[0] Component"})
     return views
+
 def _load_and_merge_schemas() -> Dict[str, Any]:
-    base_views = _get_base_default_views(); user_schema = _try_load_user_schema()
+    base_views = _get_base_default_views()
+    user_schema = _try_load_user_schema()
     if user_schema:
-        if "views" not in user_schema: user_schema["views"] = []
-        existing_view_names = {v.get("name") for v in user_schema["views"]}
-        for view in base_views:
-            if view["name"] not in existing_view_names: user_schema["views"].append(view)
+        if "views" not in user_schema:
+            user_schema["views"] = []
+        existing = {v.get("name") for v in user_schema["views"]}
+        for v in base_views:
+            if v["name"] not in existing:
+                user_schema["views"].append(v)
         return user_schema
     else:
-        return {"roles": {"X": {"dim": int(DIM_X or 0), "labels": [f"X_{i+1}" for i in range(int(DIM_X or 0))]}, "U": {"dim": int(DIM_U or 0), "labels": [f"u_{i+1}" for i in range(int(DIM_U or 0))]}}, "views": base_views, "sampling": {"Bmax": 5}}
+        return {
+            "roles": {
+                "X": {"dim": int(DIM_X or 0), "labels": [f"X_{i+1}" for i in range(int(DIM_X or 0))]},
+                "U": {"dim": int(DIM_U or 0), "labels": [f"u_{i+1}" for i in range(int(DIM_U or 0))]},
+            },
+            "views": base_views,
+            "sampling": {"Bmax": 5}
+        }
+
 SCHEMA = _load_and_merge_schemas()
 
-# --- Helper Functions ---
+# ----------------------------
+# Helpers
+# ----------------------------
 def _ensure_outdir(outdir: Optional[str]) -> str:
-    if outdir is None: outdir = os.path.join("plots", "_traj", time.strftime("%Y%m%d_%H%M%S"))
-    os.makedirs(outdir, exist_ok=True); return outdir
-def _to_np(x: torch.Tensor) -> np.ndarray: return x.detach().cpu().numpy()
-def _linspace_time(n_steps: int) -> np.ndarray: return np.linspace(0.0, float(T), num=n_steps)
+    if outdir is None:
+        outdir = os.path.join("plots", "_traj", time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
 
-# ===== (핵심 수정) P-PGDPO 래퍼 클래스 =====
+def _to_np(x: torch.Tensor) -> np.ndarray:
+    return x.detach().cpu().numpy()
+
+def _linspace_time(n_steps: int) -> np.ndarray:
+    return np.linspace(0.0, float(T), num=n_steps)
+
+def _as_ts1d(y: np.ndarray | list | float, T: int) -> np.ndarray:
+    """
+    어떤 입력이 와도 길이 T의 1D 타임시리즈로 강제 변환.
+    - 스칼라/길이 1 → T 길이로 반복
+    - 2D 이상 → 가능한 축에서 T를 찾아 1D로 압축
+    - 그래도 안 맞으면 선형보간으로 리샘플
+    """
+    a = np.asarray(y)
+    if a.ndim == 0:
+        return np.full(T, float(a))
+    a = np.squeeze(a)
+    if a.ndim == 1:
+        if a.shape[0] == T:
+            return a.astype(float)
+        if a.shape[0] == 1:
+            return np.full(T, float(a[0]))
+        # 리샘플
+        xp = np.linspace(0.0, 1.0, num=a.shape[0])
+        x  = np.linspace(0.0, 1.0, num=T)
+        return np.interp(x, xp, a.astype(float))
+    # 2D 이상
+    for ax in range(a.ndim):
+        if a.shape[ax] == T:
+            sl = [0]*a.ndim
+            sl[ax] = slice(None)
+            return a[tuple(sl)].reshape(T).astype(float)
+    # 리샘플
+    flat = a.reshape(-1).astype(float)
+    xp = np.linspace(0.0, 1.0, num=flat.shape[0])
+    x  = np.linspace(0.0, 1.0, num=T)
+    return np.interp(x, xp, flat)
+
+# ----------------------------
+# P-PGDPO 래퍼(플롯/기록용)
+# ----------------------------
 class PPDirectPolicy(nn.Module):
     def __init__(self, stage1_policy: nn.Module, seed: int):
-        super().__init__(); self.stage1_policy = stage1_policy; self.seed = seed
+        super().__init__()
+        self.stage1_policy = stage1_policy
+        self.seed = seed
     
     def forward(self, **states_dict):
-        if not _HAS_DIRECT: raise RuntimeError("'direct' utilities not available.")
-        
-        # 1. P-PGDPO로 투자(u)만 프로젝션
-        u_projected = ppgdpo_u_direct(self.stage1_policy, states_dict, repeats=REPEATS_DIR, sub_batch=SUBBATCH_DIR, seed_eval=self.seed)
-
-        # 2. 원본 정책의 전체 출력을 확인하여 소비 모델인지 판별
+        if not _HAS_DIRECT:
+            raise RuntimeError("'direct' utilities not available.")
+        u_proj = ppgdpo_u_direct(
+            self.stage1_policy, states_dict,
+            repeats=REPEATS_DIR, sub_batch=SUBBATCH_DIR, seed_eval=self.seed
+        )
         with torch.no_grad():
-            original_output = self.stage1_policy(**states_dict)
-        
-        is_consumption_model = original_output.size(1) > u_projected.size(1)
-
-        if is_consumption_model:
-            # 3. 소비 모델이면, 원본 정책에서 소비(C) 값을 가져와 결합
-            c_learned = original_output[:, u_projected.size(1):]
-            return torch.cat([u_projected, c_learned], dim=1)
-        else:
-            # 4. 아니면, 프로젝션된 투자(u)만 반환
-            return u_projected
+            out0 = self.stage1_policy(**states_dict)
+        is_consumption = out0.size(1) > u_proj.size(1)
+        if is_consumption:
+            c_learned = out0[:, u_proj.size(1):]
+            return torch.cat([u_proj, c_learned], dim=1)
+        return u_proj
 
 class PPRUNNERPolicy(nn.Module):
     def __init__(self, stage1_policy: nn.Module, seed: int):
-        super().__init__(); self.stage1_policy = stage1_policy; self.seed = seed
+        super().__init__()
+        self.stage1_policy = stage1_policy
+        self.seed = seed
     
     def forward(self, **states_dict):
-        if not _HAS_RUNNER: raise RuntimeError("'runner' utilities not available.")
-
-        # PPDirectPolicy와 동일한 로직 적용
-        u_projected = ppgdpo_u_run(self.stage1_policy, states_dict, REPEATS_RUN, SUBBATCH_RUN, self.seed)
-        
+        if not _HAS_RUNNER:
+            raise RuntimeError("'runner' utilities not available.")
+        u_proj = ppgdpo_u_run(self.stage1_policy, states_dict, REPEATS_RUN, SUBBATCH_RUN, self.seed)
         with torch.no_grad():
-            original_output = self.stage1_policy(**states_dict)
+            out0 = self.stage1_policy(**states_dict)
+        is_consumption = out0.size(1) > u_proj.size(1)
+        if is_consumption:
+            c_learned = out0[:, u_proj.size(1):]
+            return torch.cat([u_proj, c_learned], dim=1)
+        return u_proj
 
-        is_consumption_model = original_output.size(1) > u_projected.size(1)
-
-        if is_consumption_model:
-            c_learned = original_output[:, u_projected.size(1):]
-            return torch.cat([u_projected, c_learned], dim=1)
-        else:
-            return u_projected
-
+# ----------------------------
+# 기록용 래퍼
+# ----------------------------
 class RecordingPolicy(nn.Module):
     def __init__(self, base_policy: nn.Module):
         super().__init__()
@@ -129,9 +211,9 @@ class RecordingPolicy(nn.Module):
     def forward(self, **states_dict):
         self.X_frames.append(states_dict["X"].detach())
         if "Y" in states_dict and states_dict["Y"] is not None:
-            if not hasattr(self, 'Y_frames'): self.Y_frames = []
+            if not hasattr(self, "Y_frames"):
+                self.Y_frames = []
             self.Y_frames.append(states_dict["Y"].detach())
-        
         U = self.base_policy(**states_dict)
         self.U_frames.append(U.detach())
 
@@ -146,13 +228,17 @@ class RecordingPolicy(nn.Module):
             S = X[:, 0::3]
             current_rt = calculate_rt(S).sum(dim=1, keepdim=True)
             self.Rt_frames.append(current_rt)
-            
+
             mode = os.getenv("PGDPO_CURRENT_MODE")
             if estimate_costates and mode in ["projection", "run", "base"]:
                 try:
                     with torch.enable_grad():
-                        costates = estimate_costates(simulate, self.base_policy, {k:v.detach().clone().requires_grad_(True) for k,v in states_dict.items() if k in ['X', 'Y']},
-                                                     repeats=16, sub_batch=16, seed_eval=123, needs=PP_NEEDS)
+                        costates = estimate_costates(
+                            simulate, self.base_policy,
+                            {k: v.detach().clone().requires_grad_(True)
+                             for k, v in states_dict.items() if k in ["X", "Y"]},
+                            repeats=16, sub_batch=16, seed_eval=123, needs=PP_NEEDS
+                        )
                     JX = costates.get("JX")
                     if JX is not None:
                         pI = JX[:, 1::3].sum(dim=1, keepdim=True)
@@ -163,113 +249,241 @@ class RecordingPolicy(nn.Module):
         return U
 
     def stacked(self) -> Dict[str, torch.Tensor]:
-        data = {"X": torch.stack(self.X_frames, 1), "U": torch.stack(self.U_frames, 1)}
-        if hasattr(self, 'Y_frames'): data["Y"] = torch.stack(self.Y_frames, 1)
-        if self.HarvestingIncome_frames: data["HarvestingIncome"] = torch.stack(self.HarvestingIncome_frames, 1)
-        if self.Rt_frames: data["Rt"] = torch.stack(self.Rt_frames, 1)
-        if self.Costate_I_frames: data["Costate_I"] = torch.stack(self.Costate_I_frames, 1)
+        data = {"X": torch.stack(self.X_frames, 1),
+                "U": torch.stack(self.U_frames, 1)}
+        if hasattr(self, "Y_frames"):
+            data["Y"] = torch.stack(self.Y_frames, 1)
+        if self.HarvestingIncome_frames:
+            data["HarvestingIncome"] = torch.stack(self.HarvestingIncome_frames, 1)
+        if self.Rt_frames:
+            data["Rt"] = torch.stack(self.Rt_frames, 1)
+        if self.Costate_I_frames:
+            data["Costate_I"] = torch.stack(self.Costate_I_frames, 1)
         return data
-        
+
 def _simulate_and_record(policy: nn.Module, B: int, rng: torch.Generator, sync_time: bool = False) -> Dict[str, torch.Tensor]:
-    recorder = RecordingPolicy(policy).to(device); init, _ = sample_initial_states(B, rng=rng)
-    if sync_time: init['TmT'].fill_(T)
+    recorder = RecordingPolicy(policy).to(device)
+    init, _ = sample_initial_states(B, rng=rng)
+    if sync_time:
+        init["TmT"].fill_(T)
     simulate(recorder, B, initial_states_dict=init, m_steps=m, train=False, rng=rng)
     return recorder.stacked()
 
-def _series_for_view(view: Dict[str, Any], traj_np: Dict[str, Any], Bsel: List[int]) -> Tuple[np.ndarray, List[np.ndarray], List[str]]:
+# ----------------------------
+# Series/CSV 생성
+# ----------------------------
+def _series_for_view(
+    view: Dict[str, Any],
+    traj_np: Dict[str, Any],
+    Bsel: List[int],
+) -> Tuple[np.ndarray, List[np.ndarray], List[str]]:
+    """
+    플롯용 시계열 생성:
+    - 기본적으로 path #0만 사용(PGDPO_TRAJ_PLOT_FIRST=1), 아니면 선택 경로 평균
+    - 단일 인덱스여도 (T, 1)을 유지해 수평선 복제 현상 방지
+    - 유효하지 않은 인덱스는 스킵(몰래 0번으로 대체하지 않음)
+    """
     block_names = view.get("block", "X")
-    if isinstance(block_names, str): block_names = [block_names]
-    
-    x_time, all_series, all_labels = None, [], []
+    if isinstance(block_names, str):
+        block_names = [block_names]
+
+    x_time: Optional[np.ndarray] = None
+    all_series: List[np.ndarray] = []
+    all_labels: List[str] = []
 
     for block_name in block_names:
-        if block_name not in traj_np: continue
-        arr = _to_np(traj_np.get(block_name))
-        arr_sel, steps = arr[Bsel], arr.shape[1]
-        if x_time is None: x_time = _linspace_time(steps)
-        
-        # 'roles'에서 레이블 정보와 차원(dim)을 가져옵니다.
-        role_info = SCHEMA.get("roles", {}).get(block_name, {})
+        if block_name not in traj_np:
+            continue
+
+        arr = _to_np(traj_np.get(block_name))          # 보통 (B, T, dim)
+        if arr.ndim == 2:                               # (B, T) → (B, T, 1)
+            arr = arr[..., None]
+
+        arr_sel = arr[Bsel]                             # (Bsel, T, dim)
+        steps = arr.shape[1]
+        if x_time is None:
+            x_time = _linspace_time(steps)
+
+        role_info   = SCHEMA.get("roles", {}).get(block_name, {})
         labels_info = role_info.get("labels", [])
-        
-        # view에서 indices를 가져옵니다.
+
         indices = view.get("indices", [0])
-        
-        # 유효한 인덱스만 필터링합니다.
-        valid_indices = [i for i in indices if i < arr_sel.shape[-1]]
-        
-        mean_series = arr_sel[..., valid_indices].mean(axis=0)
-        series = [mean_series[:, i] for i in range(mean_series.shape[1])]
-        labels = [labels_info[idx] for idx in valid_indices] if labels_info else [f"dim_{idx}" for idx in valid_indices]
+        valid_indices = [i for i in indices if 0 <= i < arr_sel.shape[-1]]
+        if not valid_indices:                           # 잘못된 인덱스면 스킵
+            continue
+
+        if PGDPO_TRAJ_PLOT_FIRST:
+            data = arr_sel[0, :, valid_indices]         # (T, k) 또는 (T,)
+        else:
+            data = arr_sel[..., valid_indices].mean(axis=0)  # (T, k)
+
+        # 단일 인덱스여도 (T, 1) 유지
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+
+        # 1D 시리즈로 분해
+        series = [data[:, i] for i in range(data.shape[1])]
+        labels = (
+            [labels_info[idx] for idx in valid_indices]
+            if labels_info else [f"dim_{idx}" for idx in valid_indices]
+        )
+
         all_series.extend(series)
         all_labels.extend(labels)
-        
+
+    # x_time은 최소 하나의 블록에서 steps를 보고 설정됨
+    if x_time is None:
+        x_time = _linspace_time(m)  # 방어적; 빈 뷰면 길이 m로
+
     return x_time, all_series, all_labels
 
-def _handle_custom_view(view: dict, traj_np: dict, Bsel: list, policy_tag: str | None = None) -> Optional[Tuple[np.ndarray, List[np.ndarray], List[str]]]:
-    mode = (view.get("mode","") or "").lower()
+
+def _handle_custom_view(
+    view: dict,
+    traj_np: dict,
+    Bsel: list,
+    policy_tag: str | None = None
+) -> Optional[Tuple[np.ndarray, List[np.ndarray], List[str]]]:
+    """
+    커스텀 뷰 핸들러:
+    - u_rnorm, tracking_vpp, custom_sir_rt_plot, custom_sir_i_plot
+    - consumption_path / mode="consumption": C 블록 → (없으면) U 마지막 칼럼을 소비로 추출
+    """
+    mode = (view.get("mode", "") or "").lower()
+    name = (view.get("name", "") or "").lower()
+
+    # -------- (1) u_rnorm --------
     if mode == "u_rnorm":
-        U = _to_np(traj_np["U"])[Bsel, :, :d] # 소비 제외
+        U = _to_np(traj_np["U"])[Bsel, :, :d]                  # (Bsel, T, d)
         x_time = _linspace_time(U.shape[1])
-        if "R" in _R_INFO: R = _R_INFO["R"].cpu().numpy(); u_Ru = np.einsum('bti,ij,btj->bt', U, R, U); r_norm_series = np.sqrt(u_Ru).mean(axis=0)
+        if "R" in _R_INFO:
+            R = _R_INFO["R"].cpu().numpy()
+            uRu = np.einsum("bti,ij,btj->bt", U, R, U)         # (Bsel, T)
+            y = uRu[0] if PGDPO_TRAJ_PLOT_FIRST else uRu.mean(axis=0)
+            r_norm_series = np.sqrt(_as_ts1d(y, len(x_time)))
         else:
             alpha = _R_INFO.get("alpha", 0.0)
-            if alpha <= 0: r_norm_series = np.zeros(U.shape[1])
-            else: r_norm_series = np.sqrt(alpha) * np.linalg.norm(U, axis=-1).mean(axis=0)
+            if alpha <= 0:
+                r_norm_series = np.zeros(U.shape[1])
+            else:
+                y = (
+                    np.linalg.norm(U[0], axis=-1)
+                    if PGDPO_TRAJ_PLOT_FIRST else
+                    np.linalg.norm(U, axis=-1).mean(axis=0)
+                )
+                r_norm_series = np.sqrt(alpha) * _as_ts1d(y, len(x_time))
         return x_time, [r_norm_series], [view.get("block", "U")]
-    if mode == "tracking_vpp":
-        U = _to_np(traj_np["U"])[Bsel]; x_time = _linspace_time(U.shape[1]); u_total_power = U.sum(axis=-1).mean(axis=0); series, labels = [u_total_power], ["Output_Power_Sum"]
-        if _REF_FN:
-            ref_signals = _REF_FN(x_time)
-            for key, values in ref_signals.items(): series.append(np.asarray(values).reshape(-1)); labels.append(f"{key}_ref")
-        return x_time, series, labels
-    
-    if mode == "custom_sir_rt_plot":
-        Rt = _to_np(traj_np.get("Rt"))[Bsel]
-        x_time = _linspace_time(Rt.shape[1])
-        rt_series = Rt.mean(axis=0).flatten()
-        
-        X = _to_np(traj_np.get("X"))[Bsel]
-        i_indices = [i for i in range(1, X.shape[-1], 3)]
-        i_series = X[..., i_indices].sum(axis=-1).mean(axis=0).flatten()
-        return x_time, [rt_series, i_series], ["Effective_Rt", "Total_Infected"]
 
+    # -------- (2) tracking_vpp --------
+    if mode == "tracking_vpp":
+        U = _to_np(traj_np["U"])[Bsel]                         # (Bsel, T, dim)
+        x_time = _linspace_time(U.shape[1])
+        y = U[0].sum(axis=-1) if PGDPO_TRAJ_PLOT_FIRST else U.sum(axis=-1).mean(axis=0)
+        series, labels = [_as_ts1d(y, len(x_time))], ["Output_Power_Sum"]
+        if _REF_FN:
+            ref = _REF_FN(x_time)
+            for key, vals in ref.items():
+                series.append(_as_ts1d(vals, len(x_time)))
+                labels.append(f"{key}_ref")
+        return x_time, series, labels
+
+    # -------- (3) custom_sir_rt_plot --------
+    if mode == "custom_sir_rt_plot":
+        Rt = _to_np(traj_np.get("Rt"))[Bsel]                   # (Bsel, T, 1) or (Bsel, T)
+        x_time = _linspace_time(Rt.shape[1])
+        y_rt = Rt[0].flatten() if PGDPO_TRAJ_PLOT_FIRST else Rt.mean(axis=0).flatten()
+
+        X = _to_np(traj_np.get("X"))[Bsel]
+        i_idx = [i for i in range(1, X.shape[-1], 3)]
+        y_i = (
+            X[0, :, i_idx].sum(axis=-1).flatten()
+            if PGDPO_TRAJ_PLOT_FIRST else
+            X[..., i_idx].sum(axis=-1).mean(axis=0).flatten()
+        )
+        return x_time, [_as_ts1d(y_rt, len(x_time)), _as_ts1d(y_i, len(x_time))], ["Effective_Rt", "Total_Infected"]
+
+    # -------- (4) custom_sir_i_plot --------
     if mode == "custom_sir_i_plot":
         X = _to_np(traj_np.get("X"))[Bsel]
         x_time = _linspace_time(X.shape[1])
-        i_indices = [i for i in range(1, X.shape[-1], 3)]
-        i_series = X[..., i_indices].sum(axis=-1).mean(axis=0).flatten()
-        return x_time, [i_series], ["Total_Infected"]
-        
+        i_idx = [i for i in range(1, X.shape[-1], 3)]
+        y = (
+            X[0, :, i_idx].sum(axis=-1).flatten()
+            if PGDPO_TRAJ_PLOT_FIRST else
+            X[..., i_idx].sum(axis=-1).mean(axis=0).flatten()
+        )
+        return x_time, [_as_ts1d(y, len(x_time))], ["Total_Infected"]
+
+    # -------- (5) Consumption (안전 처리) --------
+    if name == "consumption_path" or mode == "consumption":
+        C = None
+        # (a) C 블록이 있으면 우선 사용
+        if "C" in traj_np:
+            C = _to_np(traj_np["C"])[Bsel]                     # (B, T) or (B, T, 1)
+            if C.ndim == 2:
+                C = C[..., None]                               # (B, T, 1)
+        # (b) 없으면 U의 마지막 성분을 소비로 가정(포트폴리오 d + 소비 1)
+        elif "U" in traj_np:
+            U = _to_np(traj_np["U"])[Bsel]                     # (B, T, dimU)
+            if U.ndim == 2:
+                U = U[..., None]
+            if U.shape[2] > d:
+                C = U[..., -1:]                                # (B, T, 1)
+
+        if C is None:
+            return None  # 소비를 찾지 못하면 뷰 스킵
+
+        x_time = _linspace_time(C.shape[1])
+        y = C[0, :, 0] if PGDPO_TRAJ_PLOT_FIRST else C[..., 0].mean(axis=0)
+        return x_time, [_as_ts1d(y, len(x_time))], ["Consumption"]
+
+    # 매치되는 커스텀 뷰 없음 → 일반 처리에게 맡김
     return None
 
+
+
 def _series_for_view_wrapper(view, traj_np, Bsel, policy_tag=None):
-    if (view.get("name","").lower().startswith("tracking")): view = {**view, "mode": "tracking_vpp"}
+    if (view.get("name","").lower().startswith("tracking")):
+        view = {**view, "mode": "tracking_vpp"}
     custom_result = _handle_custom_view(view, traj_np, Bsel, policy_tag)
-    if custom_result is not None: return custom_result
+    if custom_result is not None:
+        return custom_result
     return _series_for_view(view, traj_np, Bsel)
 
 def _save_series_to_csv(x_time, all_views_data, out_path):
-    header = ["Time"]
-    all_columns = {}
+    """
+    요약 CSV(플롯에 사용된 시리즈들).
+    ✅ 모든 시리즈를 x_time 길이(T) 1D로 강제(_as_ts1d)해서 shape 불일치 방지.
+    """
+    x_time = np.asarray(x_time, dtype=float).reshape(-1)
+    Tlen = int(x_time.shape[0])
+
+    # 1) 컬럼 맵 구성 (중복 방지)
+    #    키: "component_policy" (ref는 component 이름 그대로)
+    colmap: Dict[str, np.ndarray] = {}
     for view_name, series_map in all_views_data.items():
         for component, policies in sorted(series_map.items()):
             for policy, data in sorted(policies.items()):
-                col_name = f"{component}_{policy}"
-                if "ref" in component: col_name = component
-                if col_name not in header: header.append(col_name)
-                all_columns[col_name] = data
+                col_name = component if ("ref" in component) else f"{component}_{policy}"
+                # 길이 강제: (스칼라/길이1/2D 등) -> 길이 T 1D
+                y = _as_ts1d(data, Tlen)
+                # 최초 등장만 기록(중복 이름은 스킵)
+                if col_name not in colmap:
+                    colmap[col_name] = y
 
-    data_rows = [x_time]
-    for h in header:
-        if h == "Time": continue
-        data_rows.append(all_columns.get(h, [""] * len(x_time)))
-    
-    rows = np.stack(data_rows, axis=-1)
-    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+    # 2) 헤더/행 구성
+    header = ["Time"] + list(colmap.keys())
+    cols = [x_time] + [colmap[h] for h in header[1:]]
+
+    # 모두 길이 T의 1D 벡터가 됨 → 안전하게 스택 가능
+    rows = np.stack(cols, axis=-1)
+
+    # 3) CSV 저장
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
+
     print(f"[traj] Trajectory data saved to: {os.path.basename(out_path)}")
 
 def _save_full_trajectories_to_csv(
@@ -278,130 +492,166 @@ def _save_full_trajectories_to_csv(
     Bsel: List[int],
     out_path: str
 ):
-    """모든 정책의 모든 상태/제어 변수를 CSV 파일로 저장합니다."""
-    if not trajectories: return
+    """
+    모든 정책의 모든 상태/제어 변수를 CSV로 저장.
+    ✅ 변경: PGDPO_TRAJ_SAVE_ALL=1이면 평균 대신 path별 컬럼을 전부 기록.
+    """
+    if not trajectories:
+        return
 
-    # 1. 시간 축 생성
+    # 1) 시간축
     first_valid_traj = next((t for t in trajectories.values() if t is not None), None)
-    if first_valid_traj is None: return
-    n_steps = first_valid_traj['X'].shape[1]
+    if first_valid_traj is None:
+        return
+    n_steps = first_valid_traj["X"].shape[1]
     x_time = _linspace_time(n_steps)
 
-    # 2. 헤더 생성
+    # 2) 헤더/데이터 맵
     header = ["Time"]
-    all_data_map = {}
-    
-    roles = schema.get("roles", {})
-    
-    for policy_name, traj_data in trajectories.items():
-        if traj_data is None: continue
-        
-        # 각 데이터 블록 (X, U 등)에 대해
-        for block_name, block_tensor in traj_data.items():
-            if block_name not in roles: continue
-            
-            # Bsel 샘플들의 평균을 계산
-            block_np_avg = _to_np(block_tensor[Bsel]).mean(axis=0) # (n_steps, dim)
-            
-            labels = roles[block_name].get("labels", [f"{block_name}_{i}" for i in range(block_np_avg.shape[1])])
-            
-            for i in range(block_np_avg.shape[1]):
-                col_name = f"{labels[i]}_{policy_name}"
-                header.append(col_name)
-                all_data_map[col_name] = block_np_avg[:, i]
+    all_data_map: Dict[str, np.ndarray] = {}
 
-    # 3. CSV 파일 작성
-    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+    roles = schema.get("roles", {})
+
+    for policy_name, traj_data in trajectories.items():
+        if traj_data is None:
+            continue
+        for block_name, block_tensor in traj_data.items():
+            if block_name not in roles:
+                continue
+
+            arr_sel = _to_np(block_tensor[Bsel])  # (Bsel, n_steps, dim) 또는 (Bsel, n_steps, 1)
+            if arr_sel.ndim == 2:
+                arr_sel = arr_sel[..., None]
+            labels = roles[block_name].get(
+                "labels",
+                [f"{block_name}_{i}" for i in range(arr_sel.shape[-1])]
+            )
+
+            if PGDPO_TRAJ_SAVE_ALL:
+                # 경로별 저장
+                for b_idx, b in enumerate(Bsel):
+                    for i in range(arr_sel.shape[-1]):
+                        col = f"{labels[i]}_{policy_name}_p{b}"
+                        if col not in header:
+                            header.append(col)
+                        all_data_map[col] = arr_sel[b_idx, :, i]
+            else:
+                # 평균 저장(기존)
+                block_np_avg = arr_sel.mean(axis=0)  # (n_steps, dim)
+                for i in range(block_np_avg.shape[1]):
+                    col = f"{labels[i]}_{policy_name}"
+                    if col not in header:
+                        header.append(col)
+                    all_data_map[col] = block_np_avg[:, i]
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        
-        for i in range(n_steps):
-            row = [x_time[i]]
-            for col_name in header[1:]:
-                row.append(all_data_map.get(col_name, np.array([]))[i])
+        for t_idx in range(n_steps):
+            row = [x_time[t_idx]]
+            for col in header[1:]:
+                row.append(all_data_map.get(col, np.array([]))[t_idx])
             writer.writerow(row)
-            
+
     print(f"[traj] Full trajectory data saved to: {os.path.basename(out_path)}")
 
+# ----------------------------
+# 플로팅
+# ----------------------------
 def _plot_lines(x_time, series_map, title, ylabel, save_path, view_opts: dict = {}):
     is_dual_axis = view_opts.get("mode") == "dual_axis"
-    
-    # --- ✨ 수정된 부분 시작 ---
 
-    # 1. 기본 스타일과 라벨을 먼저 정의합니다.
     POLICY_STYLES = {
-        "cf":    {"color": "royalblue", "ls": "-",  "lw": 2.5, "zorder": 5, "label": "Ref/Myopic"},
-        "pp":    {"color": "orangered", "ls": "--", "lw": 1.8, "zorder": 4, "label": "P-PGDPO (pp)", "marker": 'o', "ms": 4, "alpha": 0.7},
-        "learn": {"color": "forestgreen", "ls": ":",  "lw": 1.8, "zorder": 3, "label": "Learned", "marker": 's', "ms": 4, "alpha": 0.7},
-        "ref":   {"color": "gray", "ls": "-.", "lw": 1.5, "zorder": 2}
+        "cf":    {"color": "royalblue",  "ls": "-",  "lw": 2.5, "zorder": 5, "label": "Ref/Myopic"},
+        "pp":    {"color": "orangered",  "ls": "--", "lw": 1.8, "zorder": 4, "label": "P-PGDPO (pp)", "marker": "o", "ms": 4, "alpha": 0.7},
+        "learn": {"color": "forestgreen","ls": ":",  "lw": 1.8, "zorder": 3, "label": "Learned", "marker": "s", "ms": 4, "alpha": 0.7},
+        "ref":   {"color": "gray",       "ls": "-.", "lw": 1.5, "zorder": 2}
     }
 
-    # 2. user_pgdpo_base.py의 get_traj_schema에 custom 라벨이 정의되어 있으면, 기본값을 덮어씁니다.
     if "legend_labels" in SCHEMA:
         custom_labels = SCHEMA["legend_labels"]
-        for policy_key, new_label in custom_labels.items():
-            if policy_key in POLICY_STYLES:
-                POLICY_STYLES[policy_key]["label"] = new_label
-    
-    # --- ✨ 수정된 부분 끝 ---
+        for key, new_label in custom_labels.items():
+            if key in POLICY_STYLES:
+                POLICY_STYLES[key]["label"] = new_label
 
     fig, ax1 = plt.subplots(figsize=(8.5, 4.5))
     ax2 = ax1.twinx() if is_dual_axis else None
-    
+
     ax_map = {}
     if is_dual_axis:
-        for component_label in series_map.keys():
-            if "costate" in component_label.lower() or "shadow" in component_label.lower():
-                ax_map[component_label] = ax2
-            else: ax_map[component_label] = ax1
+        for comp in series_map.keys():
+            if "costate" in comp.lower() or "shadow" in comp.lower():
+                ax_map[comp] = ax2
+            else:
+                ax_map[comp] = ax1
     else:
-        for component_label in series_map.keys(): ax_map[component_label] = ax1
+        for comp in series_map.keys():
+            ax_map[comp] = ax1
 
-    for component_label, policies in sorted(series_map.items()):
-        ax = ax_map.get(component_label, ax1)
-        if "ref" in component_label:
-            ref_label = POLICY_STYLES["ref"].get("label", component_label)
-            if 'cf' in policies: ax.plot(x_time, policies['cf'], label=ref_label, **POLICY_STYLES["ref"])
+    Tlen = len(x_time)
+
+    for comp_label, policies in sorted(series_map.items()):
+        ax = ax_map.get(comp_label, ax1)
+        if "ref" in comp_label:
+            # ref 라인은 'cf' 키에 저장된 것을 기본으로 그림
+            if "cf" in policies:
+                y = _as_ts1d(policies["cf"], Tlen)
+                ax.plot(x_time, y, label=POLICY_STYLES["ref"].get("label", comp_label),
+                        **{k: v for k, v in POLICY_STYLES["ref"].items() if k != "label"})
             continue
-        for policy_key in ['cf', 'pp', 'learn']:
-            if policy_key in policies:
-                data = policies[policy_key]
-                style_props = POLICY_STYLES.get(policy_key, {})
-                full_label = f"{component_label} - {style_props.get('label')}"
-                ax.plot(x_time, data, label=full_label, **{k:v for k,v in style_props.items() if k != 'label'})
+        for pkey in ["cf", "pp", "learn"]:
+            if pkey in policies:
+                y = _as_ts1d(policies[pkey], Tlen)   # ✅ 길이 강제
+                st = POLICY_STYLES.get(pkey, {})
+                full_label = f"{comp_label} - {st.get('label')}"
+                ax.plot(x_time, y, label=full_label,
+                        **{k: v for k, v in st.items() if k != "label"})
 
     ax1.set(xlabel="Time", title=title)
     if is_dual_axis and "ylabels" in view_opts:
         ax1.set_ylabel(view_opts["ylabels"][0])
-        if ax2: ax2.set_ylabel(view_opts["ylabels"][1])
+        if ax2:
+            ax2.set_ylabel(view_opts["ylabels"][1])
     else:
         ax1.set_ylabel(ylabel)
 
     if "h_lines" in view_opts:
         for line in view_opts["h_lines"]:
-            ax1.axhline(y=line["y"], color=line.get("color", "gray"), ls=line.get("ls", "--"), label=line.get("label"))
-    
-    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+            y = float(line["y"])
+            ax1.axhline(y=y, color=line.get("color", "gray"),
+                        ls=line.get("ls", "--"), label=line.get("label"))
+
+    ax1.grid(True, which="both", linestyle="--", linewidth=0.5)
     lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = (ax2.get_legend_handles_labels() if ax2 else ([],[]))
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=9)
+    lines2, labels2 = (ax2.get_legend_handles_labels() if ax2 else ([], []))
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
+# ----------------------------
+# 엔트리
+# ----------------------------
 @torch.no_grad()
-def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[nn.Module] = None, outdir: Optional[str] = None, seed_crn: Optional[int] = None) -> str:
-    outdir = _ensure_outdir(outdir); B_all = int(PGDPO_TRAJ_B or N_eval_states); seed_crn = int(seed_crn or CRN_SEED_EU)
+def generate_and_save_trajectories(
+    policy_learn: nn.Module,
+    policy_cf: Optional[nn.Module] = None,
+    outdir: Optional[str] = None,
+    seed_crn: Optional[int] = None
+) -> str:
+    outdir = _ensure_outdir(outdir)
+    B_all = int(PGDPO_TRAJ_B or N_eval_states)
+    seed_crn = int(seed_crn or CRN_SEED_EU)
     def _g(): return torch.Generator(device=device).manual_seed(seed_crn)
-    
+
     print("[traj] Simulating trajectories for 'learn' policy...")
     traj_learn = _simulate_and_record(policy_learn.to(device), B_all, _g(), sync_time=True)
-    
+
     traj_cf = _simulate_and_record(policy_cf.to(device), B_all, _g(), sync_time=True) if policy_cf else None
-    
+
     traj_pp = None
     if PGDPO_CURRENT_MODE in ["run", "projection", "residual"]:
-        if PP_MODE == 'direct' and _HAS_DIRECT:
+        if PP_MODE == "direct" and _HAS_DIRECT:
             print("[traj] Generating 'pp' trajectories using DIRECT method.")
             traj_pp = _simulate_and_record(PPDirectPolicy(policy_learn.to(device), seed_crn), B_all, _g(), sync_time=True)
         elif _HAS_RUNNER:
@@ -409,9 +659,13 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
             traj_pp = _simulate_and_record(PPRUNNERPolicy(policy_learn.to(device), seed_crn), B_all, _g(), sync_time=True)
 
     trajectories = {"learn": traj_learn, "cf": traj_cf, "pp": traj_pp}
-    Bsel = list(range(min(B_all, SCHEMA.get("sampling", {}).get("Bmax", 5))))
-    
-    # --- 기존 시각화 및 요약 CSV 저장 로직 ---
+
+    # ✅ ENV로 Bsel 크기 우선 결정
+    schema_Bmax = SCHEMA.get("sampling", {}).get("Bmax", 5)
+    Bmax = PGDPO_TRAJ_BMAX if PGDPO_TRAJ_BMAX > 0 else schema_Bmax
+    Bsel = list(range(min(B_all, Bmax)))
+
+    # --- 플롯 & 요약 CSV ---
     all_views_data = {}
     master_x_time = None
 
@@ -419,34 +673,39 @@ def generate_and_save_trajectories(policy_learn: nn.Module, policy_cf: Optional[
         series_map = {}
         x_time = None
         for name, traj in trajectories.items():
-            if traj is None: continue
-            
+            if traj is None:
+                continue
             curr_x, series, labels = _series_for_view_wrapper(view, traj, Bsel, policy_tag=name)
-            if curr_x is None or not series: continue
-            if x_time is None: 
+            if curr_x is None or not series:
+                continue
+            if x_time is None:
                 x_time = curr_x
                 if master_x_time is None:
                     master_x_time = x_time
-            
             for s, lab in zip(series, labels):
-                if lab not in series_map: series_map[lab] = {}
+                if lab not in series_map:
+                    series_map[lab] = {}
                 series_map[lab][name] = s
-        
+
         if x_time is not None and series_map:
-            _plot_lines(x_time, series_map, f"Trajectory Comparison: {view['name']}", 
-                        view.get("ylabel","Value"), os.path.join(outdir, f"traj_{view['name']}_comparison.png"),
-                        view_opts=view)
-            all_views_data[view['name']] = series_map
-                        
+            _plot_lines(
+                x_time, series_map,
+                f"Trajectory Comparison: {view['name']}",
+                view.get("ylabel", "Value"),
+                os.path.join(outdir, f"traj_{view['name']}_comparison.png"),
+                view_opts=view
+            )
+            all_views_data[view["name"]] = series_map
+
     if master_x_time is not None and all_views_data:
         _save_series_to_csv(master_x_time, all_views_data, os.path.join(outdir, "traj_comparison_data.csv"))
-        
-    # --- (신규 추가) 모든 데이터를 저장하는 로직 호출 ---
+
+    # --- ✅ 풀 CSV (경로별 저장) ---
     _save_full_trajectories_to_csv(
         trajectories=trajectories,
         schema=SCHEMA,
         Bsel=Bsel,
         out_path=os.path.join(outdir, "traj_full_data.csv")
     )
-        
+
     return outdir

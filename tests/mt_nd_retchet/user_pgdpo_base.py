@@ -33,7 +33,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DIM_X = 2; DIM_Y = k; DIM_U = d + 1
 N_eval_states = int(os.getenv("PGDPO_EVAL_STATES", 100))
-CRN_SEED_EU = int(os.getenv("PGDPO_CRN", 70))
+CRN_SEED_EU = int(os.getenv("PGDPO_CRN", 71))
 USE_CLOSED_FORM = bool(int(os.getenv("PGDPO_CF", "1")))
 RIM_STEPS = int(os.getenv("PGDPO_RIM_STEPS", str(max(200, m))))
 
