@@ -47,7 +47,7 @@ x0: float    = float(os.getenv("PGDPO_X0", "1.0"))
 lambda_curv: float = float(os.getenv("PGDPO_LAMBDA", "0.3"))
 
 # caps
-pi_cap: float     = float(os.getenv("PGDPO_PICAP", "2.0"))
+pi_cap: float     = float(os.getenv("PGDPO_PICAP", "200.0"))
 pi_l2_cap: float  = float(os.getenv("PGDPO_PI_L2_CAP", "0.0"))
 
 # seeds
